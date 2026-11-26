@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Hashable, Sequence
 
@@ -199,8 +199,83 @@ class CERAlignmentResult:
     measure_alignment: tuple[tuple[int | None, int | None], ...]
 
 
+def _split_multistaff_part(
+    part_id: str,
+    part_measures: list[CERMeasure],
+    part_max_staff: int,
+    part_system_breaks: list[int],
+    base_measure_offset: int,
+) -> tuple[list[str], list[CERMeasure], list[int]]:
+    """Canonicalize a multi-staff <part> into separate 1-staff part streams (Bucket A).
+
+    Ensures a 1-part N-staff grand-staff encoding and an N-part 1-staff encoding
+    produce identical CER measure sequences, normalized staff=1 coordinates,
+    per-staff contexts, and system break indices.
+    """
+    if part_max_staff <= 1:
+        return (
+            [part_id],
+            part_measures,
+            [base_measure_offset + b for b in part_system_breaks],
+        )
+
+    split_parts: list[str] = []
+    split_measures: list[CERMeasure] = []
+    split_breaks: list[int] = []
+    n_measures = len(part_measures)
+
+    for s in range(1, part_max_staff + 1):
+        s_part_id = f"{part_id}_s{s}"
+        split_parts.append(s_part_id)
+        s_offset = base_measure_offset + (s - 1) * n_measures
+        for b in part_system_breaks:
+            split_breaks.append(s_offset + b)
+
+        for m in part_measures:
+            s_notes: list[CERNote] = []
+            s_note_ctxs: list[CERContext] = []
+            for n, ctx in zip(m.notes, m.note_contexts):
+                if n.staff == s:
+                    s_notes.append(replace(n, staff=1))
+                    s_note_ctxs.append(ctx)
+
+            s_rests = tuple(replace(r, staff=1) for r in m.rests if r.staff == s)
+            s_dirs = tuple(replace(d, staff=1) for d in m.directions if d.staff == s)
+            s_ctx_changes = tuple(
+                (1, c_onset, c_kind, c_val)
+                for c_staff, c_onset, c_kind, c_val in m.context_changes
+                if c_kind in ("key", "time") or c_staff == s
+            )
+            s_ctx = m.contexts.get(s) or next(iter(m.contexts.values()), CERContext())
+            split_measures.append(
+                CERMeasure(
+                    part_id=s_part_id,
+                    number=m.number,
+                    index=m.index,
+                    barline_left=m.barline_left,
+                    barline_right=m.barline_right,
+                    repeat_start=m.repeat_start,
+                    repeat_end=m.repeat_end,
+                    volta=m.volta,
+                    is_implicit=m.is_implicit,
+                    contexts={1: s_ctx},
+                    context_changes=s_ctx_changes,
+                    notes=tuple(s_notes),
+                    note_contexts=tuple(s_note_ctxs),
+                    rests=s_rests,
+                    directions=s_dirs,
+                )
+            )
+
+    return split_parts, split_measures, split_breaks
+
+
 def parse_musicxml(xml_str: str) -> CERScore:
     """Parse a standard MusicXML (<score-partwise>) document into a CERScore.
+
+    Multi-staff <part> elements (<staves> > 1) are deterministically split into
+    separate canonical 1-staff part streams so grand-staff and multi-part
+    encodings are Bucket-A equivalent.
 
     Raises ValueError or xml.etree.ElementTree.ParseError on invalid input.
     """
@@ -218,14 +293,15 @@ def parse_musicxml(xml_str: str) -> CERScore:
     parts: list[str] = []
     all_measures: list[CERMeasure] = []
     system_breaks: list[int] = []
-    max_staves = 1
 
     for p_idx, part_el in enumerate(part_elems):
         part_id = part_el.attrib.get("id", f"P{p_idx + 1}")
-        parts.append(part_id)
+        part_measures: list[CERMeasure] = []
+        part_system_breaks: list[int] = []
 
         divisions = 1
         num_staves = 1
+        part_max_staff = 1
         staff_clefs: dict[int, str] = {1: "G2"}
         staff_ottava: dict[int, int] = {1: 0}
         key_fifths = 0
@@ -258,7 +334,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
 
                 if tag == "print":
                     if child.attrib.get("new-system", "no").lower() == "yes":
-                        system_breaks.append(len(all_measures))
+                        part_system_breaks.append(m_idx)
 
                 elif tag == "attributes":
                     div_txt = _child_text(child, "divisions")
@@ -271,7 +347,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
                     staves_txt = _child_text(child, "staves")
                     if staves_txt:
                         num_staves = max(1, int(staves_txt))
-                        max_staves = max(max_staves, num_staves)
+                        part_max_staff = max(part_max_staff, num_staves)
                         for s_i in range(1, num_staves + 1):
                             staff_clefs.setdefault(s_i, "F4" if s_i == 2 else "G2")
                             staff_ottava.setdefault(s_i, 0)
@@ -298,7 +374,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
                             time_den = new_den
 
                     for clef_el in _iter_children(child, "clef"):
-                        s_num = int(clef_el.attrib.get("number", "1"))
+                        s_num = max(1, int(clef_el.attrib.get("number", "1")))
                         sign = _child_text(clef_el, "sign", "G")
                         line = _child_text(clef_el, "line", "2")
                         clef_str = f"{sign}{line}"
@@ -307,7 +383,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
                             context_changes.append((s_num, cursor, "clef", clef_str))
                         staff_clefs[s_num] = clef_str
                         staff_ottava.setdefault(s_num, 0)
-                        max_staves = max(max_staves, s_num)
+                        part_max_staff = max(part_max_staff, s_num)
 
                     if m_idx == 0 and cursor == 0:
                         initialized_context = True
@@ -346,7 +422,8 @@ def parse_musicxml(xml_str: str) -> CERScore:
                             barline_right = mapped_style
 
                 elif tag == "direction":
-                    dir_staff = int(_child_text(child, "staff", "1"))
+                    dir_staff = max(1, int(_child_text(child, "staff", "1")))
+                    part_max_staff = max(part_max_staff, dir_staff)
                     offset_txt = _child_text(child, "offset")
                     dir_onset = cursor
                     if offset_txt:
@@ -400,7 +477,8 @@ def parse_musicxml(xml_str: str) -> CERScore:
                                     )
 
                 elif tag == "harmony":
-                    h_staff = int(_child_text(child, "staff", "1"))
+                    h_staff = max(1, int(_child_text(child, "staff", "1")))
+                    part_max_staff = max(part_max_staff, h_staff)
                     root_el = _find_child(child, "root")
                     root_step = _child_text(root_el, "root-step") if root_el is not None else ""
                     root_alt = _child_text(root_el, "root-alter") if root_el is not None else ""
@@ -418,8 +496,8 @@ def parse_musicxml(xml_str: str) -> CERScore:
                     pitch_el = _find_child(child, "pitch")
 
                     voice = _child_text(child, "voice", "1")
-                    staff = int(_child_text(child, "staff", "1"))
-                    max_staves = max(max_staves, staff)
+                    staff = max(1, int(_child_text(child, "staff", "1")))
+                    part_max_staff = max(part_max_staff, staff)
                     staff_clefs.setdefault(staff, "F4" if staff == 2 else "G2")
                     staff_ottava.setdefault(staff, 0)
 
@@ -542,15 +620,15 @@ def parse_musicxml(xml_str: str) -> CERScore:
 
             measure_contexts = {
                 s_i: CERContext(
-                    clef=staff_clefs.get(s_i, "G2"),
+                    clef=staff_clefs.get(s_i, "F4" if s_i == 2 else "G2"),
                     key_fifths=key_fifths,
                     time_num=time_num,
                     time_den=time_den,
                     ottava=staff_ottava.get(s_i, 0),
                 )
-                for s_i in range(1, max(num_staves, max_staves) + 1)
+                for s_i in range(1, max(num_staves, part_max_staff) + 1)
             }
-            all_measures.append(
+            part_measures.append(
                 CERMeasure(
                     part_id=part_id,
                     number=m_num,
@@ -570,10 +648,21 @@ def parse_musicxml(xml_str: str) -> CERScore:
                 )
             )
 
+        s_parts, s_measures, s_breaks = _split_multistaff_part(
+            part_id=part_id,
+            part_measures=part_measures,
+            part_max_staff=part_max_staff,
+            part_system_breaks=part_system_breaks,
+            base_measure_offset=len(all_measures),
+        )
+        parts.extend(s_parts)
+        all_measures.extend(s_measures)
+        system_breaks.extend(s_breaks)
+
     return CERScore(
         parts=tuple(parts),
         measures=tuple(all_measures),
-        num_staves=max_staves,
+        num_staves=max(1, len(parts)),
         system_breaks=tuple(sorted(set(system_breaks))),
     )
 

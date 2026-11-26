@@ -83,13 +83,18 @@ class TestCERParser(unittest.TestCase):
             "</measure>"
         )
         score = parse_musicxml(_wrap_partwise(m1))
-        self.assertEqual(score.total_measures, 1)
+        # Multi-staff <part> is canonicalized into 2 separate 1-staff part streams
+        self.assertEqual(score.parts, ("P1_s1", "P1_s2"))
+        self.assertEqual(score.total_measures, 2)
         self.assertEqual(score.num_staves, 2)
-        meas = score.measures[0]
-        self.assertEqual(meas.barline_right, "final")
-        self.assertEqual(len(meas.notes), 4)
+        meas_s1, meas_s2 = score.measures
+        self.assertEqual(meas_s1.barline_right, "final")
+        self.assertEqual(meas_s2.barline_right, "final")
+        self.assertEqual(len(meas_s1.notes), 3)
+        self.assertEqual(len(meas_s2.notes), 1)
 
-        g4, b4, d5, g2 = meas.notes
+        g4, b4, d5 = meas_s1.notes
+        (g2,) = meas_s2.notes
         # divisions=2 -> whole note = 8 ticks
         self.assertEqual(g4.onset, Fraction(0))
         self.assertEqual(g4.duration, Fraction(1, 2))
@@ -101,11 +106,12 @@ class TestCERParser(unittest.TestCase):
         # Forward 2 ticks (1/4 whole) -> D5 onset = 1/2 + 1/4 = 3/4
         self.assertEqual(d5.onset, Fraction(3, 4))
         self.assertEqual(d5.duration, Fraction(1, 4))
-        # Backup 8 ticks -> G2 starts at 0 on staff 2
+        # Backup 8 ticks -> G2 starts at 0 on canonicalized second part stream (staff=1)
         self.assertEqual(g2.onset, Fraction(0))
-        self.assertEqual(g2.staff, 2)
-        self.assertEqual(meas.note_contexts[3].clef, "F4")
-        self.assertEqual(meas.note_contexts[0].key_fifths, 1)
+        self.assertEqual(g2.staff, 1)
+        self.assertEqual(meas_s2.note_contexts[0].clef, "F4")
+        self.assertEqual(meas_s1.note_contexts[0].key_fifths, 1)
+        self.assertEqual(meas_s2.note_contexts[0].key_fifths, 1)
 
     def test_mid_piece_context_changes_and_ties(self) -> None:
         m1 = (
@@ -268,6 +274,97 @@ class TestTwoStageAlignment(unittest.TestCase):
         self.assertTrue(bad_q.catastrophic_failure)
         self.assertIn("unparseable", bad_q.cf_reasons)
         self.assertEqual(bad_q.q_score, 0.0)
+
+    def test_multistaff_part_equivalent_to_separate_parts(self) -> None:
+        """Bucket-A equivalence: 1 <part><staves>2</staves> == 2 <part><staves>1</staves>."""
+        grand_staff_xml = _wrap_partwise(
+            '<measure number="1">'
+            "<attributes>"
+            "<divisions>2</divisions>"
+            "<staves>2</staves>"
+            "<key><fifths>1</fifths></key>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            '<clef number="1"><sign>G</sign><line>2</line></clef>'
+            '<clef number="2"><sign>F</sign><line>4</line></clef>'
+            "</attributes>"
+            + _note_xml("G", 4, 4, voice="1", staff=1, staccato=True)
+            + _note_xml("B", 4, 4, voice="1", staff=1, tie_start=True)
+            + "<backup><duration>8</duration></backup>"
+            + _note_xml("G", 2, 8, voice="2", staff=2, tie_start=True)
+            + "</measure>"
+            + '<measure number="2">'
+            + '<print new-system="yes"/>'
+            + "<attributes><key><fifths>2</fifths></key></attributes>"
+            + _note_xml("B", 4, 8, voice="1", staff=1, tie_stop=True)
+            + "<backup><duration>8</duration></backup>"
+            + _note_xml("G", 2, 8, voice="2", staff=2, tie_stop=True)
+            + '<barline location="right"><bar-style>light-heavy</bar-style></barline>'
+            + "</measure>"
+        )
+
+        two_parts_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<score-partwise version="4.0">\n'
+            '  <part id="P1">\n'
+            '    <measure number="1">'
+            "<attributes>"
+            "<divisions>2</divisions>"
+            "<staves>1</staves>"
+            "<key><fifths>1</fifths></key>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            '<clef><sign>G</sign><line>2</line></clef>'
+            "</attributes>"
+            + _note_xml("G", 4, 4, voice="1", staff=1, staccato=True)
+            + _note_xml("B", 4, 4, voice="1", staff=1, tie_start=True)
+            + "</measure>\n"
+            + '    <measure number="2">'
+            + '<print new-system="yes"/>'
+            + "<attributes><key><fifths>2</fifths></key></attributes>"
+            + _note_xml("B", 4, 8, voice="1", staff=1, tie_stop=True)
+            + '<barline location="right"><bar-style>light-heavy</bar-style></barline>'
+            + "</measure>\n"
+            "  </part>\n"
+            '  <part id="P2">\n'
+            '    <measure number="1">'
+            "<attributes>"
+            "<divisions>2</divisions>"
+            "<staves>1</staves>"
+            "<key><fifths>1</fifths></key>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            '<clef><sign>F</sign><line>4</line></clef>'
+            "</attributes>"
+            + _note_xml("G", 2, 8, voice="1", staff=1, tie_start=True)
+            + "</measure>\n"
+            + '    <measure number="2">'
+            + '<print new-system="yes"/>'
+            + "<attributes><key><fifths>2</fifths></key></attributes>"
+            + _note_xml("G", 2, 8, voice="1", staff=1, tie_stop=True)
+            + '<barline location="right"><bar-style>light-heavy</bar-style></barline>'
+            + "</measure>\n"
+            "  </part>\n"
+            "</score-partwise>\n"
+        )
+
+        # Test both directions: grand-staff pred vs 2-part GT, and 2-part pred vs grand-staff GT
+        for pred_xml, gt_xml in (
+            (grand_staff_xml, two_parts_xml),
+            (two_parts_xml, grand_staff_xml),
+        ):
+            pm = score_musicxml_pair(
+                pred_xml,
+                gt_xml,
+                page_id="p_grand",
+                work_id="w_grand",
+                domain="CDR",
+                tier="T1",
+            )
+            q = compute_page_quality(pm)
+            self.assertAlmostEqual(pm.s_note, 1.0)
+            self.assertAlmostEqual(pm.s_struct, 1.0)
+            self.assertAlmostEqual(pm.s_expr, 1.0)
+            self.assertAlmostEqual(pm.s_play, 1.0)
+            self.assertFalse(q.catastrophic_failure)
+            self.assertAlmostEqual(q.q_score, 100.0)
 
 
 if __name__ == "__main__":
