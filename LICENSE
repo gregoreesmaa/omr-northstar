@@ -1,9 +1,10 @@
-# Dual License
+# Multi-Component License
 
-This repository is dual-licensed by content type:
+This repository and its accompanying benchmark datasets are licensed by content type:
 
 1. **Code, Reference Scorer, CLI, Tests, and JSON Schemas** (`omr_northstar/`, `tests/`, `schemas/`, `pyproject.toml`): licensed under the **MIT License**.
 2. **Benchmark Specifications and Documentation** (`README.md`, `docs/`): licensed under the **Creative Commons Attribution 4.0 International License (CC-BY-4.0)**.
+3. **Test Data & Evaluation Packs** (`pilot_dev_v0_1/` synthetic fixtures and the 125-page v0.1 pilot pack hosted at `https://huggingface.co/datasets/gregoreesmaa/omr-northstar-v0.1`): licensed under **CC-BY-4.0** overall (100% permissive Core Track: `CC0-1.0` / `PDM-1.0` / `CC-BY-4.0`, zero `CC-BY-NC`). Individual per-page licenses and upstream attributions (OpenScore, IMSLP, Staatsbibliothek zu Berlin, and `HugoSchtr/debussy-omr` / BnF Gallica) are recorded in the dataset's `LICENSE` and `manifest.json`. Benchmark evaluation packs are intended for evaluation only and should not be used to train models evaluated on OMR-NorthStar.
 
 ---
 

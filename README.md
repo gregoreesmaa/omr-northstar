@@ -190,3 +190,4 @@ python -m omr_northstar validate-report report_a.json
 
 - **Code, Reference Scorer, CLI, Tests, and JSON Schemas:** [MIT License](LICENSE)
 - **Specifications and Documentation (`README.md`, `docs/`):** [CC-BY-4.0](LICENSE)
+- **Test Data (`pilot_dev_v0_1/` & [Hugging Face v0.1 Pilot Pack](https://huggingface.co/datasets/gregoreesmaa/omr-northstar-v0.1)):** [CC-BY-4.0](LICENSE) overall (`CC0-1.0` / `PDM-1.0` / `CC-BY-4.0`, 100% permissive Core Track, zero `CC-BY-NC`; per-page licenses and attributions in the dataset `LICENSE` and `manifest.json`)
