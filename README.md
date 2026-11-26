@@ -77,6 +77,16 @@ The 40 negative-control pages (`n_gt = 0` non-music/blank-staff pages and spread
 
 ## Public Baseline Results (v0.1, 125 pages)
 
+The unpacked 125-page v0.1 pilot evaluation pack (125 PNG page images + 46 canonical MusicXML ground-truth files + `manifest.json`, 100% permissive `CC0-1.0` / `PDM-1.0` / `CC-BY-4.0`) is hosted publicly on Hugging Face:
+
+- **Dataset:** [huggingface.co/datasets/gregoreesmaa/omr-northstar-v0.1](https://huggingface.co/datasets/gregoreesmaa/omr-northstar-v0.1) — **License:** `CC-BY-4.0` overall (100% permissive Core Track: 97 `CC0-1.0`, 20 `CC0-1.0`/`PDM-1.0`, 8 `CC-BY-4.0`; zero `CC-BY-NC`; full per-stratum provenance & attribution in the dataset `LICENSE` and `manifest.json`).
+
+```bash
+huggingface-cli download gregoreesmaa/omr-northstar-v0.1 --repo-type dataset --local-dir ./omr-northstar-v0.1
+```
+
+*(Note: In v0.1, `ALS` and `RWP` are pilot degradations derived from the `CDR` anchors pending full physical flatbed scanning and smartphone capture for v1.0; `HWM` contains real historical handwritten manuscripts.)*
+
 All public baselines are evaluated **zero-shot with out-of-the-box defaults** in offline Docker/CPU isolation on the 125-page v0.1 pilot pack (**31 CDR + 31 ALS + 31 RWP + 28 HWM + 4 Pillar 3B Negative Controls**: 2 blank staff pages + 2 text program-notes pages), scored with the canonicalized `omr-northstar` CER reference evaluator (`89c698c`).
 
 | System | Version / License | NS Score (95% CI) | Tier-W NS | CDR Q (CFR) | ALS Q (CFR) | RWP Q (CFR) | HWM Q (CFR) | `S_note` | `S_expr` | `mean_NTSR` | `NMHR` |
