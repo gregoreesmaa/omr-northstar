@@ -87,19 +87,20 @@ huggingface-cli download gregoreesmaa/omr-northstar-v0.1 --repo-type dataset --l
 
 *(Note: In v0.1, `ALS` and `RWP` are pilot degradations derived from the `CDR` anchors pending full physical flatbed scanning and smartphone capture for v1.0; `HWM` contains real historical handwritten manuscripts.)*
 
-All public baselines are evaluated **zero-shot with out-of-the-box defaults** in offline Docker/CPU isolation on the 125-page v0.1 pilot pack (**31 CDR + 31 ALS + 31 RWP + 28 HWM + 4 Pillar 3B Negative Controls**: 2 blank staff pages + 2 text program-notes pages), scored with the canonicalized `omr-northstar` CER reference evaluator (`89c698c`).
+All public baselines are evaluated **zero-shot with out-of-the-box defaults** in offline isolated execution on the 125-page v0.1 pilot pack (**31 CDR + 31 ALS + 31 RWP + 28 HWM + 4 Pillar 3B Negative Controls**: 2 blank staff pages + 2 text program-notes pages), scored with the canonicalized `omr-northstar` CER reference evaluator (`89c698c`).
 
 | System | Version / License | NS Score (95% CI) | Tier-W NS | CDR Q (CFR) | ALS Q (CFR) | RWP Q (CFR) | HWM Q (CFR) | `S_note` | `S_expr` | `mean_NTSR` | `NMHR` |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | **Oracle GT** *(ceiling)* | Ground Truth | **99.53** `[99.32, 99.68]` | 99.69 | 99.70 (0.0%) | 99.66 (0.0%) | 99.66 (0.0%) | 99.34 (0.0%) | 1.0000 | 1.0000 | +1.000 | 0.0% |
 | **homr** | `0.7.1` / AGPL-3.0 | **14.67** `[12.02, 17.78]` | 25.24 | 60.76 (31.4%) | 35.65 (67.7%) | 69.21 (19.4%) | 8.56 (92.9%) | 0.5037 | 0.2545 | +0.324 | 0.0% |
 | **Audiveris** | `5.11.0` / AGPL-3.0 | **2.81** `[1.49, 3.80]` | 11.90 | 72.07 (22.9%) | 2.15 (100.0%) | 33.60 (67.7%) | 0.55 (100.0%) | 0.3379 | 0.1896 | +0.161 | 0.0% |
+| **Qwen2.5-VL-7B-Instruct** *(VLM)* | `7B` / Apache-2.0 | **1.57** `[0.98, 2.02]` | 3.49 | 13.22 (85.7%) | 1.73 (100.0%) | 1.56 (100.0%) | 5.01 (100.0%) | 0.0336 | 0.0401 | -9.509 | 0.0% |
 
 **Methodology & Notes:**
-- **Unified Single-Pipeline Protocol:** Each system receives raw page images only (no domain tags, oracle routing, or per-stratum tuning) under offline container/CPU execution.
-- **Cross-Domain Bottleneck:** Classical and modern print-oriented OMR systems achieve strong clean-engraving performance (`CDR` `60.8`–`72.1`), but suffer severe catastrophic failure rates (`CFR`) on archival scans (`ALS`) and real handwritten manuscripts (`HWM`), driving composite `NS` sharply down as designed.
-- **Negative-Control Gate (`NC-Gate`):** Both `homr` and `Audiveris` pass all 4/4 Pillar 3B negative controls (`0.0%` Non-Music Hallucination Rate).
-- **Upcoming Public Baselines:** Additional open-source baselines (`oemer 0.1.8`, `SMT++`, `Qwen2.5-VL-7B-Instruct`) are currently in progress and will be added to this table upon completion.
+- **Unified Single-Pipeline Protocol:** Each system receives raw page images only (no domain tags, oracle routing, or per-stratum tuning). Classical/specialized OMR baselines (`homr`, `Audiveris`) ran in offline Docker/CPU isolation; the zero-shot general VLM baseline (`Qwen2.5-VL-7B-Instruct`, deterministic BF16 greedy ABC prompting + `music21` conversion) ran on a single NVIDIA L4 GPU (24 GB VRAM).
+- **Cross-Domain Bottleneck:** Classical and modern print-oriented OMR systems achieve strong clean-engraving performance (`CDR` `60.8`–`72.1`), but suffer severe catastrophic failure rates (`CFR`) on archival scans (`ALS`) and real handwritten manuscripts (`HWM`), driving composite `NS` sharply down as designed. Meanwhile, zero-shot general VLMs (`Qwen2.5-VL-7B-Instruct`) emit parseable notation on `81.6%` of pages but suffer severe pitch/rhythm hallucination loops (`S_note` `0.0336`, `mean_NTSR` `-9.509`).
+- **Negative-Control Gate (`NC-Gate`):** All evaluated baselines (`homr`, `Audiveris`, `Qwen2.5-VL-7B-Instruct`) pass all 4/4 Pillar 3B negative controls (`0.0%` Non-Music Hallucination Rate).
+- **Upcoming Public Baselines:** Additional open-source baselines (`oemer 0.1.8`, `SMT++`) are currently in progress and will be added to this table upon completion.
 
 ---
 
