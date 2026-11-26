@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gregoreesmaa/omr-northstar/schemas/report.schema.json",
+  "title": "OMR-NorthStar Evaluation Report",
+  "description": "Canonical 4-layer report.json emitted by the OMR-NorthStar deterministic reference evaluator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_version",
+    "split",
+    "system_name",
+    "layer1_headline",
+    "layer2_matrix_and_deltas",
+    "layer3_error_taxonomy",
+    "layer4_forensic_pack"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "benchmark_version": { "type": "string", "minLength": 1 },
+    "split": { "type": "string", "enum": ["dev-v1", "test-v1", "fresh"] },
+    "system_name": { "type": "string", "minLength": 1 },
+    "layer1_headline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ns_score",
+        "m_geom",
+        "worst_stratum_q",
+        "cfr_max",
+        "stratum_scores",
+        "stratum_cfr",
+        "axes_macro",
+        "human_utility"
+      ],
+      "properties": {
+        "ns_score": { "type": "number", "minimum": 0, "maximum": 100 },
+        "ns_ci95": {
+          "type": ["array", "null"],
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "m_geom": { "type": "number", "minimum": 0, "maximum": 100 },
+        "worst_stratum_q": { "type": "number", "minimum": 0, "maximum": 100 },
+        "cfr_max": { "type": "number", "minimum": 0, "maximum": 1 },
+        "stratum_scores": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["CDR", "ALS", "RWP", "HWM"],
+          "properties": {
+            "CDR": { "type": "number", "minimum": 0, "maximum": 100 },
+            "ALS": { "type": "number", "minimum": 0, "maximum": 100 },
+            "RWP": { "type": "number", "minimum": 0, "maximum": 100 },
+            "HWM": { "type": "number", "minimum": 0, "maximum": 100 }
+          }
+        },
+        "stratum_cfr": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["CDR", "ALS", "RWP", "HWM"],
+          "properties": {
+            "CDR": { "type": "number", "minimum": 0, "maximum": 1 },
+            "ALS": { "type": "number", "minimum": 0, "maximum": 1 },
+            "RWP": { "type": "number", "minimum": 0, "maximum": 1 },
+            "HWM": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "axes_macro": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["s_note", "s_struct", "s_expr", "s_play"],
+          "properties": {
+            "s_note": { "type": "number", "minimum": 0, "maximum": 1 },
+            "s_struct": { "type": "number", "minimum": 0, "maximum": 1 },
+            "s_expr": { "type": "number", "minimum": 0, "maximum": 1 },
+            "s_play": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "human_utility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["median_wfpp", "p90_wfpp", "p99_wfpp", "mean_ntsr", "nupr"],
+          "properties": {
+            "median_wfpp": { "type": "number", "minimum": 0 },
+            "p90_wfpp": { "type": "number", "minimum": 0 },
+            "p99_wfpp": { "type": "number", "minimum": 0 },
+            "mean_ntsr": { "type": "number", "maximum": 1 },
+            "nupr": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "layer2_matrix_and_deltas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tier_domain_matrix", "paired_deltas"],
+      "properties": {
+        "tier_domain_matrix": {
+          "type": "object",
+          "description": "Map of tier (T0..T5) -> domain (CDR/ALS/RWP/HWM) -> {mean_q, median_wfpp, count}."
+        },
+        "paired_deltas": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "delta_engraver": { "type": ["number", "null"] },
+            "delta_photo": { "type": ["number", "null"] },
+            "delta_handwriting": { "type": ["number", "null"] }
+          }
+        },
+        "adversarial_scorecard": {
+          "type": "object",
+          "properties": {
+            "phr": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "ostinato_tsr": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "q4_q1_ratio": { "type": ["number", "null"], "minimum": 0 },
+            "non_music_fp_count": { "type": ["integer", "null"], "minimum": 0 },
+            "cross_page_spanner_f1": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "french_score_staff_acc": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "layer3_error_taxonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "layout_segmentation_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "global_context_drift_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "pitch_accidental_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "rhythm_meter_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "polyphony_routing_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "engraving_expressive_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "hallucination_truncation_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "annotation_contamination_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "layer4_forensic_pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worst_pages", "best_pages"],
+      "properties": {
+        "worst_pages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["page_id", "domain", "q_score", "wfpp", "catastrophic_failure"],
+            "properties": {
+              "page_id": { "type": "string" },
+              "domain": { "type": "string", "enum": ["CDR", "ALS", "RWP", "HWM"] },
+              "q_score": { "type": "number" },
+              "wfpp": { "type": "number" },
+              "catastrophic_failure": { "type": "boolean" }
+            }
+          }
+        },
+        "best_pages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["page_id", "domain", "q_score", "wfpp", "catastrophic_failure"],
+            "properties": {
+              "page_id": { "type": "string" },
+              "domain": { "type": "string", "enum": ["CDR", "ALS", "RWP", "HWM"] },
+              "q_score": { "type": "number" },
+              "wfpp": { "type": "number" },
+              "catastrophic_failure": { "type": "boolean" }
+            }
+          }
+        },
+        "efficiency_telemetry": {
+          "type": "object",
+          "properties": {
+            "median_latency_s": { "type": ["number", "null"], "minimum": 0 },
+            "p95_latency_s": { "type": ["number", "null"], "minimum": 0 },
+            "peak_memory_gb": { "type": ["number", "null"], "minimum": 0 },
+            "parameter_count": { "type": ["integer", "null"], "minimum": 0 }
+          }
+        }
+      }
+    }
+  }
+}

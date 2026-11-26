@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gregoreesmaa/omr-northstar/schemas/page_metadata.schema.json",
+  "title": "OMR-NorthStar Page Metadata",
+  "description": "Canonical per-page physical, notational, provenance, and paired-capture metadata for OMR-NorthStar (OMR-NS) benchmark manifests.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "page_id",
+    "work_id",
+    "split",
+    "domain",
+    "complexity_tier",
+    "visual_tier",
+    "repertoire_stratum",
+    "staff_space_px",
+    "geometry",
+    "photometry",
+    "optics_codec",
+    "provenance",
+    "license"
+  ],
+  "properties": {
+    "page_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique immutable page identifier within the benchmark release."
+    },
+    "work_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical musical work identifier used to enforce work-level split disjointness."
+    },
+    "page_index_in_work": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based page number within a multi-page sequence (for continuity benchmarks)."
+    },
+    "split": {
+      "type": "string",
+      "enum": ["dev-v1", "test-v1", "fresh"],
+      "description": "Benchmark split assignment."
+    },
+    "domain": {
+      "type": "string",
+      "enum": ["CDR", "ALS", "RWP", "HWM"],
+      "description": "Visual domain: CDR (Clean Digital Render), ALS (Archival/Library Scan), RWP (Real-World Phone Photo), HWM (Handwritten Manuscript)."
+    },
+    "complexity_tier": {
+      "type": "string",
+      "enum": ["T0", "T1", "T2", "T3", "T4", "T5"],
+      "description": "Orthogonal musical & engraving complexity tier."
+    },
+    "visual_tier": {
+      "type": "string",
+      "enum": ["E", "M", "H", "B"],
+      "description": "Quantitative visual/physical difficulty sub-tier: E (Easy), M (Medium), H (Hard), B (Brutal)."
+    },
+    "sub_profile": {
+      "type": "string",
+      "description": "Optional domain sub-profile (e.g., HWM-a, HWM-b, HWM-c, HWM-Hybrid, A5_Phone_Glare_Brutal)."
+    },
+    "repertoire_stratum": {
+      "type": "string",
+      "enum": [
+        "T1.1", "T1.2", "T1.3", "T1.4",
+        "T2.1", "T2.2", "T2.3", "T2.4",
+        "T3.1", "T3.2", "T3.3", "T3.4", "T3.5", "T3.6", "T3.7"
+      ],
+      "description": "Fine-grained musicological taxonomy stratum."
+    },
+    "paired_anchor_id": {
+      "type": ["string", "null"],
+      "description": "Shared anchor ID linking identical musical ground truth across Paired Protocols A-E."
+    },
+    "paired_protocol": {
+      "type": ["string", "null"],
+      "enum": ["A", "B", "C", "D1", "D2", "D3", "E", null],
+      "description": "Paired-capture controlled isolation protocol identifier, if applicable."
+    },
+    "staff_space_px": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["median"],
+      "properties": {
+        "median": { "type": "number", "exclusiveMinimum": 0 },
+        "min": { "type": "number", "exclusiveMinimum": 0 },
+        "max": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rotation_deg", "keystone_x_deg", "keystone_y_deg"],
+      "properties": {
+        "rotation_deg": { "type": "number", "minimum": -180, "maximum": 180 },
+        "keystone_x_deg": { "type": "number", "minimum": -60, "maximum": 60 },
+        "keystone_y_deg": { "type": "number", "minimum": -60, "maximum": 60 },
+        "curvature_sagitta_px": { "type": "number", "minimum": 0 },
+        "framing_class": {
+          "type": "string",
+          "enum": ["full_page", "tight_crop", "cluttered_stand", "two_page_spread", "partial_crop"]
+        }
+      }
+    },
+    "photometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["weber_contrast", "illumination_gradient_ev"],
+      "properties": {
+        "weber_contrast": { "type": "number", "minimum": 0, "maximum": 1 },
+        "illumination_gradient_ev": { "type": "number", "minimum": 0 },
+        "bleed_through_alpha": { "type": "number", "minimum": 0, "maximum": 1 },
+        "specular_clip_area_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "stroke_width_cv": { "type": "number", "minimum": 0 }
+      }
+    },
+    "optics_codec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blur_sigma_px", "bit_depth", "codec"],
+      "properties": {
+        "blur_sigma_px": { "type": "number", "minimum": 0 },
+        "motion_blur_px": { "type": "number", "minimum": 0 },
+        "bit_depth": { "type": "integer", "enum": [1, 8, 16, 24, 32] },
+        "codec": { "type": "string", "minLength": 1 },
+        "quality_factor": { "type": ["integer", "null"], "minimum": 1, "maximum": 100 }
+      }
+    },
+    "notational_tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "Edge-case phenomenon tags (e.g., mid_bar_clef, cross_staff_beam, double_accidental, ottava_break, french_score)."
+    },
+    "occlusion_and_noise_tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "Physical artifact tags (e.g., bleed_through, library_stamp, finger_clip, fold_crease, cross_out, pencil_overlay, plastic_sleeve)."
+    },
+    "stress_test_families": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["1A", "1B", "1C", "2A", "2B", "2C", "3A", "3B", "3C"]
+      },
+      "uniqueItems": true
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_type", "gt_verification"],
+      "properties": {
+        "source_type": { "type": "string", "minLength": 1 },
+        "engraver_or_publisher": { "type": ["string", "null"] },
+        "music_font": { "type": ["string", "null"] },
+        "writer_id": { "type": ["string", "null"] },
+        "capture_device_id": { "type": ["string", "null"] },
+        "gt_verification": {
+          "type": "string",
+          "enum": ["born_digital_canonical", "double_blind_human_adjudicated"]
+        },
+        "human_agreement_f1": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "image_phash": { "type": ["string", "null"] }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["music_license", "image_license"],
+      "properties": {
+        "music_license": {
+          "type": "string",
+          "enum": ["Public-Domain", "CC0-1.0", "CC-BY-4.0"]
+        },
+        "image_license": {
+          "type": "string",
+          "enum": ["Public-Domain", "CC0-1.0", "CC-BY-4.0"]
+        },
+        "attribution": { "type": "string" }
+      }
+    }
+  }
+}

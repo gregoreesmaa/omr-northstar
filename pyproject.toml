@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omr-northstar"
+version = "1.0.0"
+description = "OMR-NorthStar: Unified North Star benchmark specification, JSON schemas, and deterministic reference scorer for Optical Music Recognition."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Gregor Eesmaa", email = "6941817+gregoreesmaa@users.noreply.github.com" },
+]
+requires-python = ">=3.10"
+keywords = [
+    "optical-music-recognition",
+    "omr",
+    "benchmark",
+    "musicxml",
+    "mei",
+    "evaluation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+omr-northstar = "omr_northstar.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["omr_northstar*"]
