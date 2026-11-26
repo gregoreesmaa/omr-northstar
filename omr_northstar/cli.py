@@ -8,60 +8,27 @@ import pathlib
 import sys
 from typing import Any, Sequence
 
-from .scoring import DOMAINS, TIERS, PageMetrics, build_report
-
-REQUIRED_MANIFEST_FIELDS: tuple[str, ...] = (
-    "page_id",
-    "work_id",
-    "split",
-    "domain",
-    "complexity_tier",
-    "visual_tier",
-    "repertoire_stratum",
-    "staff_space_px",
-    "geometry",
-    "photometry",
-    "optics_codec",
-    "provenance",
-    "license",
+from .compare import compare_reports, format_comparison
+from .scoring import DOMAINS, PageMetrics, build_report, compute_page_quality
+from .validate import (
+    PERMISSIVE_LICENSES,
+    REQUIRED_PAGE_FIELDS,
+    VALID_VISUAL_TIERS,
+    validate_disjoint_splits,
+    validate_manifest,
+    validate_page_records,
+    validate_report,
 )
+
+# Backward-compatible aliases
+REQUIRED_MANIFEST_FIELDS = REQUIRED_PAGE_FIELDS
 VALID_SPLITS = {"dev-v1", "test-v1", "fresh"}
-VALID_VISUAL_TIERS = {"E", "M", "H", "B"}
-VALID_LICENSES = {"Public-Domain", "CC0-1.0", "CC-BY-4.0"}
+VALID_LICENSES = set(PERMISSIVE_LICENSES) | {"Public-Domain"}
 
 
 def validate_manifest_records(records: Sequence[dict[str, Any]]) -> list[str]:
     """Validate a list of page metadata records against OMR-NS schema rules."""
-    errors: list[str] = []
-    seen_ids: set[str] = set()
-    for idx, rec in enumerate(records):
-        prefix = f"record[{idx}]"
-        if not isinstance(rec, dict):
-            errors.append(f"{prefix}: expected object, got {type(rec).__name__}")
-            continue
-        for req in REQUIRED_MANIFEST_FIELDS:
-            if req not in rec:
-                errors.append(f"{prefix}: missing required field '{req}'")
-        pid = rec.get("page_id")
-        if pid in seen_ids:
-            errors.append(f"{prefix}: duplicate page_id '{pid}'")
-        elif isinstance(pid, str):
-            seen_ids.add(pid)
-        if rec.get("split") not in VALID_SPLITS:
-            errors.append(f"{prefix}: invalid split {rec.get('split')!r}")
-        if rec.get("domain") not in DOMAINS:
-            errors.append(f"{prefix}: invalid domain {rec.get('domain')!r}")
-        if rec.get("complexity_tier") not in TIERS:
-            errors.append(f"{prefix}: invalid complexity_tier {rec.get('complexity_tier')!r}")
-        if rec.get("visual_tier") not in VALID_VISUAL_TIERS:
-            errors.append(f"{prefix}: invalid visual_tier {rec.get('visual_tier')!r}")
-        lic = rec.get("license")
-        if isinstance(lic, dict):
-            if lic.get("music_license") not in VALID_LICENSES:
-                errors.append(f"{prefix}: non-permissive music_license {lic.get('music_license')!r}")
-            if lic.get("image_license") not in VALID_LICENSES:
-                errors.append(f"{prefix}: non-permissive image_license {lic.get('image_license')!r}")
-    return errors
+    return validate_page_records(records, allow_legacy_pd=True)
 
 
 def format_scorecard(report: dict[str, Any]) -> str:
@@ -79,9 +46,14 @@ def format_scorecard(report: dict[str, Any]) -> str:
         f"M_geom          : {l1['m_geom']:.2f}",
         f"Worst Stratum Q : {l1['worst_stratum_q']:.2f}",
         f"CFR_max         : {l1['cfr_max'] * 100:.2f}%",
-        "",
-        "Domain Strata (Q / CFR):",
     ]
+    if l1.get("tier_weighted_ns") is not None:
+        lines.append(f"Tier-Weighted NS: {l1['tier_weighted_ns']:.2f} / 100.00")
+    if l1.get("ns_ci95") is not None:
+        lo, hi = l1["ns_ci95"]
+        lines.append(f"NS 95% CI       : [{lo:.2f}, {hi:.2f}]")
+
+    lines.extend(["", "Domain Strata (Q / CFR):"])
     for d in DOMAINS:
         q = l1["stratum_scores"][d]
         cfr = l1["stratum_cfr"][d] * 100.0
@@ -132,7 +104,10 @@ def _cmd_score(args: argparse.Namespace) -> int:
         adversarial = payload.get("adversarial_scorecard")
         telemetry = payload.get("efficiency_telemetry")
     else:
-        print("Error: input JSON must be a list of page objects or an object with a 'pages' key.", file=sys.stderr)
+        print(
+            "Error: input JSON must be a list of page objects or an object with a 'pages' key.",
+            file=sys.stderr,
+        )
         return 1
 
     pages = [PageMetrics.from_dict(item) for item in raw_pages]
@@ -143,6 +118,24 @@ def _cmd_score(args: argparse.Namespace) -> int:
         adversarial=adversarial,
         telemetry=telemetry,
     )
+    if args.include_per_page:
+        per_page = []
+        for p in pages:
+            r = compute_page_quality(p)
+            per_page.append(
+                {
+                    "page_id": p.page_id,
+                    "work_id": p.work_id,
+                    "domain": p.domain,
+                    "tier": p.tier,
+                    "q_score": round(r.q_score, 4),
+                    "wfpp": round(r.effective_wfpp, 4),
+                    "ntsr": round(r.ntsr, 4),
+                    "catastrophic_failure": r.catastrophic_failure,
+                }
+            )
+        report["layer4_forensic_pack"]["per_page_scores"] = per_page
+
     print(format_scorecard(report))
 
     if args.json_out:
@@ -151,36 +144,121 @@ def _cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_compare(args: argparse.Namespace) -> int:
+    rep_a = json.loads(pathlib.Path(args.report_a).read_text(encoding="utf-8"))
+    rep_b = json.loads(pathlib.Path(args.report_b).read_text(encoding="utf-8"))
+    diff = compare_reports(
+        rep_a,
+        rep_b,
+        n_perm=args.n_perm,
+        seed=args.seed,
+        alpha=args.alpha,
+    )
+    print(format_comparison(diff))
+    if args.json_out:
+        out_path = pathlib.Path(args.json_out)
+        out_path.write_text(json.dumps(diff, indent=2) + "\n", encoding="utf-8")
+    return 0 if diff["passed"] else 1
+
+
 def _cmd_validate_manifest(args: argparse.Namespace) -> int:
     src = pathlib.Path(args.manifest_json)
     payload = json.loads(src.read_text(encoding="utf-8"))
-    records = payload if isinstance(payload, list) else payload.get("pages", [])
-    errors = validate_manifest_records(records)
+    errors = validate_manifest(payload, allow_legacy_pd=args.allow_legacy_pd)
     if errors:
         for err in errors:
             print(f"INVALID: {err}", file=sys.stderr)
         return 1
-    print(f"OK: validated {len(records)} page metadata record(s).")
+    count = len(payload) if isinstance(payload, list) else len(payload.get("pages", []))
+    print(f"OK: validated {count} page metadata record(s).")
+    return 0
+
+
+def _cmd_validate_splits(args: argparse.Namespace) -> int:
+    dev = json.loads(pathlib.Path(args.dev_manifest).read_text(encoding="utf-8"))
+    test = json.loads(pathlib.Path(args.test_manifest).read_text(encoding="utf-8"))
+    errors: list[str] = []
+    errors.extend(f"[dev] {e}" for e in validate_manifest(dev, allow_legacy_pd=args.allow_legacy_pd))
+    errors.extend(f"[test] {e}" for e in validate_manifest(test, allow_legacy_pd=args.allow_legacy_pd))
+    errors.extend(validate_disjoint_splits(dev, test))
+    if errors:
+        for err in errors:
+            print(f"INVALID: {err}", file=sys.stderr)
+        return 1
+    dev_n = len(dev) if isinstance(dev, list) else len(dev.get("pages", []))
+    test_n = len(test) if isinstance(test, list) else len(test.get("pages", []))
+    print(f"OK: splits are valid and disjoint (dev={dev_n} pages, test={test_n} pages).")
+    return 0
+
+
+def _cmd_validate_report(args: argparse.Namespace) -> int:
+    src = pathlib.Path(args.report_json)
+    payload = json.loads(src.read_text(encoding="utf-8"))
+    errors = validate_report(payload)
+    if errors:
+        for err in errors:
+            print(f"INVALID: {err}", file=sys.stderr)
+        return 1
+    print(
+        f"OK: report '{payload.get('system_name')}' ({payload.get('split')}) "
+        f"is valid (NS={payload['layer1_headline']['ns_score']:.2f})."
+    )
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="omr-northstar",
-        description="OMR-NorthStar (OMR-NS) reference scorer and manifest validator.",
+        description="OMR-NorthStar (OMR-NS) reference scorer, comparator, and validator.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_score = sub.add_parser("score", help="Score a page-level results JSON file.")
     p_score.add_argument("results_json", help="Path to page-level results JSON.")
     p_score.add_argument("--system-name", default=None, help="Override system name.")
-    p_score.add_argument("--split", default="dev-v1", choices=["dev-v1", "test-v1", "fresh"])
+    p_score.add_argument("--split", default="dev-v1", help="Benchmark split (dev-v1, test-v1, fresh-YYYY).")
     p_score.add_argument("--json-out", default=None, help="Write canonical report.json to path.")
+    p_score.add_argument(
+        "--include-per-page",
+        action="store_true",
+        help="Include per_page_scores in layer4_forensic_pack for paired permutation compare().",
+    )
     p_score.set_defaults(func=_cmd_score)
 
-    p_val = sub.add_parser("validate-manifest", help="Validate a page metadata manifest JSON.")
+    p_cmp = sub.add_parser("compare", help="Compare two report.json files (Layer 4 regression diff).")
+    p_cmp.add_argument("report_a", help="Baseline report.json (System A).")
+    p_cmp.add_argument("report_b", help="Candidate report.json (System B).")
+    p_cmp.add_argument("--n-perm", type=int, default=1000, help="Paired permutation count.")
+    p_cmp.add_argument("--seed", type=int, default=42, help="Deterministic RNG seed.")
+    p_cmp.add_argument("--alpha", type=float, default=0.05, help="Significance threshold.")
+    p_cmp.add_argument("--json-out", default=None, help="Write comparison diff JSON to path.")
+    p_cmp.set_defaults(func=_cmd_compare)
+
+    p_val = sub.add_parser("validate-manifest", help="Validate a split manifest JSON and governance rules.")
     p_val.add_argument("manifest_json", help="Path to manifest JSON.")
+    p_val.add_argument(
+        "--allow-legacy-pd",
+        action="store_true",
+        help="Allow legacy 'Public-Domain' string alongside SPDX PDM-1.0.",
+    )
     p_val.set_defaults(func=_cmd_validate_manifest)
+
+    p_splits = sub.add_parser(
+        "validate-splits",
+        help="Validate dev and test manifests plus zero-leakage cross-split disjointness.",
+    )
+    p_splits.add_argument("dev_manifest", help="Path to dev manifest JSON.")
+    p_splits.add_argument("test_manifest", help="Path to test manifest JSON.")
+    p_splits.add_argument(
+        "--allow-legacy-pd",
+        action="store_true",
+        help="Allow legacy 'Public-Domain' string alongside SPDX PDM-1.0.",
+    )
+    p_splits.set_defaults(func=_cmd_validate_splits)
+
+    p_rep = sub.add_parser("validate-report", help="Validate a canonical report.json file.")
+    p_rep.add_argument("report_json", help="Path to report.json.")
+    p_rep.set_defaults(func=_cmd_validate_report)
 
     parsed = parser.parse_args(argv)
     return int(parsed.func(parsed))

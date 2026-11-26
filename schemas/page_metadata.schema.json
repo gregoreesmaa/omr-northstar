@@ -13,7 +13,6 @@
     "complexity_tier",
     "visual_tier",
     "repertoire_stratum",
-    "staff_space_px",
     "geometry",
     "photometry",
     "optics_codec",
@@ -37,9 +36,11 @@
       "description": "1-based page number within a multi-page sequence (for continuity benchmarks)."
     },
     "split": {
-      "type": "string",
-      "enum": ["dev-v1", "test-v1", "fresh"],
-      "description": "Benchmark split assignment."
+      "description": "Benchmark split assignment.",
+      "anyOf": [
+        { "type": "string", "enum": ["dev-v1", "test-v1", "fresh"] },
+        { "type": "string", "pattern": "^fresh-[0-9]{4}$" }
+      ]
     },
     "domain": {
       "type": "string",
@@ -55,6 +56,27 @@
       "type": "string",
       "enum": ["E", "M", "H", "B"],
       "description": "Quantitative visual/physical difficulty sub-tier: E (Easy), M (Medium), H (Hard), B (Brutal)."
+    },
+    "visual_severity": {
+      "type": "string",
+      "enum": ["V1", "V2", "V3", "V4"],
+      "description": "Normalized visual severity level (V1=Easy, V2=Medium, V3=Hard, V4=Brutal)."
+    },
+    "is_negative_control": {
+      "type": "boolean",
+      "default": false,
+      "description": "True for non-music negative control pages (title pages, text-only pages, blank manuscript paper)."
+    },
+    "track": {
+      "type": "string",
+      "enum": ["core_permissive", "research_nc_eval_only"],
+      "default": "core_permissive",
+      "description": "Licensing track: core_permissive (SPDX permissive only) or research_nc_eval_only (evaluation-only NC track, strictly forbidden for training)."
+    },
+    "eval_only": {
+      "type": "boolean",
+      "default": false,
+      "description": "True when the page is restricted to evaluation-only use (strictly forbidden for training). Mandatory true on research_nc_eval_only track."
     },
     "sub_profile": {
       "type": "string",
@@ -78,14 +100,40 @@
       "enum": ["A", "B", "C", "D1", "D2", "D3", "E", null],
       "description": "Paired-capture controlled isolation protocol identifier, if applicable."
     },
+    "human_agreement_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Inter-annotator agreement score between independent human engravers (empirical human ceiling)."
+    },
+    "ambiguous_spans": {
+      "type": "array",
+      "description": "Bucket-C genuinely ambiguous spans accepted via multi-reference alt_set.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["measure", "reason"],
+        "properties": {
+          "measure": { "type": "integer", "minimum": 1 },
+          "staff": { "type": ["integer", "null"], "minimum": 1 },
+          "onset": { "type": ["string", "number", "null"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "alt_readings": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
     "staff_space_px": {
-      "type": "object",
+      "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["median"],
+      "description": "Staff-space height in pixels; may be null for non-music negative control pages without staves.",
       "properties": {
-        "median": { "type": "number", "exclusiveMinimum": 0 },
-        "min": { "type": "number", "exclusiveMinimum": 0 },
-        "max": { "type": "number", "exclusiveMinimum": 0 }
+        "median": { "type": "number", "minimum": 0 },
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 }
       }
     },
     "geometry": {
@@ -133,6 +181,12 @@
       "uniqueItems": true,
       "description": "Edge-case phenomenon tags (e.g., mid_bar_clef, cross_staff_beam, double_accidental, ottava_break, french_score)."
     },
+    "phenomena_tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "Canonical phenomenon-level slice tags for mandatory quota tracking and sliced evaluation."
+    },
     "occlusion_and_noise_tags": {
       "type": "array",
       "items": { "type": "string" },
@@ -176,14 +230,50 @@
       "properties": {
         "music_license": {
           "type": "string",
-          "enum": ["Public-Domain", "CC0-1.0", "CC-BY-4.0"]
+          "enum": [
+            "CC0-1.0", "PDM-1.0", "CC-BY-4.0", "MIT", "BSD-3-Clause", "Apache-2.0",
+            "CC-BY-NC-4.0", "CC-BY-NC-SA-4.0", "CC-BY-NC-3.0",
+            "Public-Domain"
+          ]
         },
         "image_license": {
           "type": "string",
-          "enum": ["Public-Domain", "CC0-1.0", "CC-BY-4.0"]
+          "enum": [
+            "CC0-1.0", "PDM-1.0", "CC-BY-4.0", "MIT", "BSD-3-Clause", "Apache-2.0",
+            "CC-BY-NC-4.0", "CC-BY-NC-SA-4.0", "CC-BY-NC-3.0",
+            "Public-Domain"
+          ]
         },
         "attribution": { "type": "string" }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "track": { "const": "research_nc_eval_only" } },
+        "required": ["track"]
+      },
+      "then": {
+        "required": ["eval_only"],
+        "properties": {
+          "eval_only": { "const": true }
+        }
+      },
+      "else": {
+        "properties": {
+          "license": {
+            "properties": {
+              "music_license": {
+                "enum": ["CC0-1.0", "PDM-1.0", "CC-BY-4.0", "MIT", "BSD-3-Clause", "Apache-2.0", "Public-Domain"]
+              },
+              "image_license": {
+                "enum": ["CC0-1.0", "PDM-1.0", "CC-BY-4.0", "MIT", "BSD-3-Clause", "Apache-2.0", "Public-Domain"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

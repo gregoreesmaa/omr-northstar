@@ -51,31 +51,32 @@ Aggregate F1 hides rare, high-leverage failures: a single hallucinated accidenta
 - **Test cases:** Small-scale cue notes vs. main notes; temporary *ossia* staves; mid-bar clef/key/time changes; cautionary vs. active accidentals; invisible/dashed/*mensurstrich* barlines and unmeasured cadenzas; double-sided verso bleed-through (15–35% ink contrast).
 - **Pass criteria:** Cue/Main Role Separation F1 `>= 92%`; Mid-Bar Clef/Key State-Propagation Accuracy `>= 96%`; Bleed-Through False-Positive Rate `<= 1%`.
 
-### 2C. Mixed-Domain & Heavily Annotated Score Traps
+### 2C. Mixed-Domain & Heavily Annotated Score Traps (`HWM-Hybrid`)
 - **Test cases:** Printed scores overlaid with pencil fingerings, bowings, circled accidentals, breathing commas, dynamic underlines, translucent yellow/pink highlighter bands, crossed-out bars (`X` / `VI-DE`), taped-in handwritten patch measures, and marginal sticky-notes.
 - **Pass criteria (Dual-Layer Evaluation):**
   - **Printed-Text Invariance (`Clean-vs-Annotated ΔF1`) `<= 3%`**.
   - **Annotation False-Note Rate `<= 0.5%`**.
-  - *(Optional Tier-2)* **Explicit Annotation Separation F1 `>= 85%`**.
+  - *(Optional Secondary Track)* **Explicit Annotation Separation F1 `>= 85%`**.
 
 ---
 
 ## Pillar 3: Robustness, Invariance & Negative Controls
 
 ### 3A. Paired Counterfactuals (Exact-Score Domain-Drop Matrix)
-50–100 diverse scores rendered across 5 paired views sharing identical ground truth: `clean_digital`, `archival_scan`, `phone_photo_mild`, `phone_photo_extreme`, and `handwritten_copy`.
+Built directly on Paired Protocols A–D (`docs/03-visual-and-manuscript-domains.md` §6; 30 Dev / 60 Test `CDR`/`ALS` ↔ `RWP` pairs + 20 Dev / 40 Test multi-engraver pairs + 15 Dev / 30 Test `CDR` ↔ `HWM-b` pairs) sharing identical ground truth via `paired_anchor_id` across `clean_digital`, `archival_scan`, `phone_photo_mild` (`V1`–`V2`), `phone_photo_extreme` (`V3`–`V4`), and `handwritten_copy`.
 - **Target domain-drop gates ($\Delta_{\text{domain}} = F1_{\text{clean}} - F1_{\text{target}}$):** $\Delta_{\text{scan}} \le 2\%$, $\Delta_{\text{phone\_mild}} \le 3\%$, $\Delta_{\text{phone\_extreme}} \le 6\%$, $\Delta_{\text{handwritten}} \le 8\%$.
 
-### 3B. Out-of-Distribution (OOD) & Negative Controls
-- **Non-Music Rejection Set:** Title pages, tables of contents, text-only program notes/libretti, copyright pages, blank manuscript staff paper (empty staves, zero notes), non-music graphics/tables.
-- **Orientation & Framing Traps:** Scores rotated `90°`, `180°`, `270°`; two-page open-book spreads across a curved center gutter; partial-page crops.
-- **Pass criteria:**
-  - **Non-Music Hallucination Rate = `0%`** (`FP Note Count = 0`).
+### 3B. Out-of-Distribution (OOD) & Negative Controls (40 Pages: `16 dev-v1 / 24 test-v1`)
+Evaluated outside the 720-page `Q(P)` average via the mandatory **Negative-Control Gate (`NC-Gate`)** (`docs/04-metrics-and-human-utility.md` §2.4) so `n_gt = 0` pages never cause division by zero:
+- **Non-Music Rejection Set (`n_gt = 0`):** Title pages, tables of contents, text-only program notes/libretti, copyright pages, blank manuscript staff paper (empty staves, zero notes), non-music graphics/tables.
+- **Orientation & Framing Traps:** Scores rotated `90°`, `180°`, `270°` (baked directly into pixels with stripped/neutral EXIF so metadata shortcuts fail); two-page open-book spreads across a curved center gutter; partial-page crops.
+- **Pass criteria (`NC-Gate`):**
+  - **Non-Music Hallucination Rate (`NMHR`) = `0%`** (`NC_FP = 0`).
   - **Orientation Invariance:** $F1(90^\circ/180^\circ/270^\circ) \ge F1(0^\circ) - 1\%$.
   - **Two-Page Spread Ordering Accuracy = `100%`** (never merge left-page system 1 with right-page system 1).
 
 ### 3C. Multi-Page Continuity & Long-Horizon Score Coherence
-2–4 consecutive pages testing cross-page ties/slurs/hairpins/`8va`/`Ped.`, implicit instrument-name & transposition carryover from page 1, French-score staff hiding/reappearing across pages, and cross-page measure numbering / `D.S. al Coda` navigation.
+Delivered via the **Multi-Page Sequence Input Contract** (`docs/01-architecture-and-governance.md` §4 & `docs/06-submission-and-harness.md` §2.2): ordered 2–4 consecutive pages (`page_index_in_work = 1..k`) testing cross-page ties/slurs/hairpins/`8va`/`Ped.`, implicit instrument-name & transposition carryover from page 1, French-score staff hiding/reappearing across pages, and cross-page measure numbering / `D.S. al Coda` navigation.
 - **Pass criteria:**
   - **Cross-Page Spanner Closure F1 `>= 95%`**.
   - **French-Score Staff-Identity Tracking Accuracy `>= 98%`**.

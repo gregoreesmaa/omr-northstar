@@ -10,12 +10,21 @@ Implements the exact mathematical definitions from:
 from __future__ import annotations
 
 import math
+import random
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 DOMAINS: tuple[str, ...] = ("CDR", "ALS", "RWP", "HWM")
 TIERS: tuple[str, ...] = ("T0", "T1", "T2", "T3", "T4", "T5")
+TIER_WEIGHTS: dict[str, float] = {
+    "T0": 0.05,
+    "T1": 0.15,
+    "T2": 0.25,
+    "T3": 0.25,
+    "T4": 0.18,
+    "T5": 0.12,
+}
 
 ERROR_BUCKET_KEYS: tuple[str, ...] = (
     "layout_segmentation_pct",
@@ -127,9 +136,18 @@ def compute_effective_measure_cost(
 
 
 def compute_ntsr(wfpp: float, transcribe_cost: float) -> float:
-    """Net Time Saved Ratio: NTSR(P) = 1 - wFPP(P) / TranscribeCost(P)."""
-    if transcribe_cost <= 0:
-        raise ValueError("transcribe_cost must be strictly positive.")
+    """Net Time Saved Ratio: NTSR(P) = 1 - wFPP(P) / TranscribeCost(P).
+
+    Handles non-music negative-control pages (transcribe_cost == 0):
+      - wfpp == 0 -> 1.0 (zero false-positive edits)
+      - wfpp > 0  -> -wfpp (strictly negative utility)
+    """
+    if wfpp < 0:
+        raise ValueError("wfpp must be non-negative.")
+    if transcribe_cost < 0:
+        raise ValueError("transcribe_cost must be non-negative.")
+    if transcribe_cost == 0.0:
+        return 1.0 if wfpp == 0.0 else -float(wfpp)
     return 1.0 - (wfpp / transcribe_cost)
 
 
@@ -149,6 +167,11 @@ def compute_catastrophic_penalties(
     Returns:
         (is_cf, reasons, penalty_multiplier, effective_wfpp)
     """
+    if page.k_dropped_systems < 0:
+        raise ValueError("k_dropped_systems must be non-negative.")
+    if page.n_gt < 0 or page.n_pred < 0 or page.m_gt < 0 or page.m_pred < 0:
+        raise ValueError("Note and measure counts must be non-negative.")
+
     reasons: list[str] = []
     mult = 1.0
     effective_wfpp = page.wfpp
@@ -157,9 +180,9 @@ def compute_catastrophic_penalties(
     if not page.parseable:
         reasons.append("unparseable")
         mult = 0.0
-        effective_wfpp = 1.2 * page.transcribe_cost
+        effective_wfpp = max(1.2 * page.transcribe_cost, 1.5 if page.transcribe_cost == 0.0 else 0.0)
 
-    # 2. Skipped / empty page
+    # 2. Skipped / empty page (only when GT actually contains music)
     if page.n_gt > 0 and page.n_pred == 0:
         reasons.append("empty_output")
         mult = 0.0
@@ -169,19 +192,28 @@ def compute_catastrophic_penalties(
         reasons.append("dropped_system")
         mult *= 0.85 ** page.k_dropped_systems
 
-    # 4. Hallucination / repetition loop
-    over_predicted = page.n_gt > 0 and page.n_pred > 1.5 * page.n_gt
+    # 4. Hallucination / repetition loop (also catches music hallucinated on non-music n_gt == 0 pages)
+    over_predicted = (
+        (page.n_gt > 0 and page.n_pred > 1.5 * page.n_gt)
+        or (page.n_gt == 0 and page.n_pred > 0)
+    )
     if over_predicted or page.has_repetition_loop:
         reasons.append("hallucination_loop")
         if page.n_gt > 0:
             loop_pen = min(1.0, (1.5 * page.n_gt) / max(page.n_pred, 1))
             mult *= loop_pen
+        elif page.n_pred > 0:
+            mult = 0.0
 
-    # 5. Structural collapse
+    # 5. Structural collapse (safe when m_gt == 0 and m_pred == 0 on non-music pages)
     measure_ratio_bad = (
-        page.m_gt > 0 and abs(page.m_pred - page.m_gt) / page.m_gt > 0.25
+        (page.m_gt > 0 and abs(page.m_pred - page.m_gt) / page.m_gt > 0.25)
+        or (page.m_gt == 0 and page.m_pred > 0)
     )
-    if page.bsvr < 0.50 or measure_ratio_bad:
+    is_clean_non_music = (
+        page.n_gt == 0 and page.n_pred == 0 and page.m_gt == 0 and page.m_pred == 0
+    )
+    if (not is_clean_non_music and page.bsvr < 0.50) or measure_ratio_bad:
         reasons.append("structural_collapse")
 
     return (len(reasons) > 0, tuple(reasons), mult, effective_wfpp)
@@ -249,6 +281,66 @@ def compute_stratum_scores(
     return stratum_scores, stratum_cfr
 
 
+def compute_tier_scores(
+    page_results: Sequence[PageScoreResult],
+) -> tuple[dict[str, float | None], dict[str, float | None]]:
+    """Compute piece-level macro-average Q_t and CFR_t per complexity tier T0..T5."""
+    by_tier_work: dict[str, dict[str, list[PageScoreResult]]] = {
+        t: defaultdict(list) for t in TIERS
+    }
+    by_tier_pages: dict[str, list[PageScoreResult]] = {t: [] for t in TIERS}
+
+    for res in page_results:
+        t = res.page.tier
+        if t not in by_tier_pages:
+            raise ValueError(f"Unknown tier {t!r}; expected one of {TIERS}.")
+        by_tier_pages[t].append(res)
+        by_tier_work[t][res.page.work_id].append(res)
+
+    tier_scores: dict[str, float | None] = {}
+    tier_cfr: dict[str, float | None] = {}
+    for t in TIERS:
+        pages = by_tier_pages[t]
+        if not pages:
+            tier_scores[t] = None
+            tier_cfr[t] = None
+            continue
+        work_means = [
+            sum(r.q_score for r in work_pages) / len(work_pages)
+            for work_pages in by_tier_work[t].values()
+        ]
+        tier_scores[t] = sum(work_means) / len(work_means)
+        tier_cfr[t] = sum(1 for r in pages if r.catastrophic_failure) / len(pages)
+
+    return tier_scores, tier_cfr
+
+
+def compute_tier_weighted_ns(
+    page_results: Sequence[PageScoreResult],
+    tier_weights: Mapping[str, float] = TIER_WEIGHTS,
+) -> float:
+    """Compute 6-tier weighted North Star breakdown renormalized over active tiers.
+
+    Uses weights T0: 0.05, T1: 0.15, T2: 0.25, T3: 0.25, T4: 0.18, T5: 0.12
+    renormalized over tiers present in `page_results`, damped by
+    (1 - 0.50 * max_active_tier CFR_t).
+    """
+    tier_scores, tier_cfr = compute_tier_scores(page_results)
+    active = [t for t in TIERS if tier_scores[t] is not None]
+    if not active:
+        return 0.0
+    total_w = sum(float(tier_weights[t]) for t in active)
+    if total_w <= 0.0:
+        return 0.0
+    weighted_q = sum(
+        (float(tier_weights[t]) / total_w) * float(tier_scores[t])  # type: ignore[arg-type]
+        for t in active
+    )
+    cfr_max = max(float(tier_cfr[t]) for t in active)  # type: ignore[arg-type]
+    cfr_max = max(0.0, min(1.0, cfr_max))
+    return weighted_q * (1.0 - 0.50 * cfr_max)
+
+
 def compute_northstar_score(
     stratum_scores: Mapping[str, float],
     stratum_cfr: Mapping[str, float],
@@ -277,6 +369,76 @@ def compute_northstar_score(
     )
 
 
+def compute_ns_bootstrap_ci(
+    page_results: Sequence[PageScoreResult],
+    *,
+    n_boot: int = 1000,
+    seed: int = 42,
+    ci: float = 0.95,
+) -> tuple[float, float] | None:
+    """Deterministic work-clustered bootstrap confidence interval for NS.
+
+    Resamples whole `work_id` clusters with replacement within each domain stratum
+    using a seeded `random.Random(seed)` PRNG.
+    """
+    if not page_results:
+        return None
+    if n_boot <= 0:
+        raise ValueError("n_boot must be strictly positive.")
+    if not (0.0 < ci < 1.0):
+        raise ValueError("ci must be strictly between 0 and 1.")
+
+    by_domain_work: dict[str, dict[str, list[PageScoreResult]]] = {
+        d: defaultdict(list) for d in DOMAINS
+    }
+    for res in page_results:
+        d = res.page.domain
+        if d not in by_domain_work:
+            raise ValueError(f"Unknown domain {d!r}; expected one of {DOMAINS}.")
+        by_domain_work[d][res.page.work_id].append(res)
+
+    # Precompute deterministic sorted work summaries per domain: (mean_q, n_pages, n_cf)
+    domain_clusters: dict[str, list[tuple[float, int, int]]] = {}
+    for d in DOMAINS:
+        clusters: list[tuple[float, int, int]] = []
+        for wid in sorted(by_domain_work[d].keys()):
+            w_pages = by_domain_work[d][wid]
+            mean_q = sum(r.q_score for r in w_pages) / len(w_pages)
+            n_cf = sum(1 for r in w_pages if r.catastrophic_failure)
+            clusters.append((mean_q, len(w_pages), n_cf))
+        domain_clusters[d] = clusters
+
+    rng = random.Random(seed)
+    boot_ns: list[float] = []
+    for _ in range(n_boot):
+        s_scores: dict[str, float] = {}
+        s_cfr: dict[str, float] = {}
+        for d in DOMAINS:
+            clusters = domain_clusters[d]
+            k = len(clusters)
+            if k == 0:
+                s_scores[d] = 0.0
+                s_cfr[d] = 1.0
+                continue
+            q_sum = 0.0
+            total_pages = 0
+            total_cf = 0
+            for _ in range(k):
+                mq, npg, ncf = clusters[rng.randrange(k)]
+                q_sum += mq
+                total_pages += npg
+                total_cf += ncf
+            s_scores[d] = q_sum / k
+            s_cfr[d] = total_cf / total_pages
+        boot_ns.append(compute_northstar_score(s_scores, s_cfr).ns_score)
+
+    boot_ns.sort()
+    alpha = (1.0 - ci) / 2.0
+    lo = _percentile(boot_ns, alpha * 100.0)
+    hi = _percentile(boot_ns, (1.0 - alpha) * 100.0)
+    return (lo, hi)
+
+
 def compute_paired_deltas(
     page_results: Sequence[PageScoreResult],
 ) -> dict[str, float | None]:
@@ -301,12 +463,14 @@ def compute_paired_deltas(
         rwp_items = [r for r in items if r.page.domain == "RWP"]
         hwm_items = [r for r in items if r.page.domain == "HWM"]
 
-        # Engraver spread within CDR
-        if len(cdr_items) >= 2:
-            engravers = {r.page.engraver for r in cdr_items if r.page.engraver}
-            if len(engravers) >= 2:
-                qs = [r.q_score for r in cdr_items]
-                engraver_spreads.append(max(qs) - min(qs))
+        # Engraver spread within CDR (grouped per engraver to avoid duplicate-render skew)
+        by_engraver: dict[str, list[float]] = defaultdict(list)
+        for r in cdr_items:
+            if r.page.engraver:
+                by_engraver[r.page.engraver].append(r.q_score)
+        if len(by_engraver) >= 2:
+            eng_means = [sum(qs) / len(qs) for qs in by_engraver.values()]
+            engraver_spreads.append(max(eng_means) - min(eng_means))
 
         # Photo delta: RWP - baseline (CDR if present else ALS)
         baseline_for_photo = cdr_items if cdr_items else als_items
@@ -369,11 +533,15 @@ def build_report(
     benchmark_version: str = "1.0.0",
     adversarial: Mapping[str, Any] | None = None,
     telemetry: Mapping[str, Any] | None = None,
+    n_boot: int = 1000,
+    bootstrap_seed: int = 42,
 ) -> dict[str, Any]:
     """Build a canonical 4-layer report.json dictionary."""
     results = [compute_page_quality(p) for p in pages]
     stratum_scores, stratum_cfr = compute_stratum_scores(results)
     ns = compute_northstar_score(stratum_scores, stratum_cfr)
+    ns_ci = compute_ns_bootstrap_ci(results, n_boot=n_boot, seed=bootstrap_seed)
+    tier_weighted_ns = compute_tier_weighted_ns(results)
     paired_deltas = compute_paired_deltas(results)
 
     n = len(results)
@@ -460,7 +628,12 @@ def build_report(
         "system_name": system_name,
         "layer1_headline": {
             "ns_score": round(ns.ns_score, 4),
-            "ns_ci95": None,
+            "ns_ci95": (
+                [round(ns_ci[0], 4), round(ns_ci[1], 4)]
+                if ns_ci is not None
+                else None
+            ),
+            "tier_weighted_ns": round(tier_weighted_ns, 4),
             "m_geom": round(ns.m_geom, 4),
             "worst_stratum_q": round(ns.worst_stratum_q, 4),
             "cfr_max": round(ns.cfr_max, 4),

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gregoreesmaa/omr-northstar/schemas/manifest.schema.json",
+  "title": "OMR-NorthStar Split Manifest",
+  "description": "Canonical full split manifest envelope for OMR-NorthStar (OMR-NS) benchmark releases (dev-v1, test-v1, fresh-YYYY).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_version",
+    "split",
+    "pages"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "benchmark_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Semantic version of the benchmark release (e.g., 1.0.0)."
+    },
+    "split": {
+      "description": "Split identifier for all pages contained in this manifest.",
+      "anyOf": [
+        { "type": "string", "enum": ["dev-v1", "test-v1", "fresh"] },
+        { "type": "string", "pattern": "^fresh-[0-9]{4}$" }
+      ]
+    },
+    "canary": {
+      "type": ["string", "null"],
+      "description": "Anti-contamination canary string (required on dev splits, e.g., OMR_NS_V1_CANARY_DO_NOT_TRAIN)."
+    },
+    "track": {
+      "type": "string",
+      "enum": ["core_permissive", "research_nc_eval_only"],
+      "default": "core_permissive",
+      "description": "Manifest licensing track: core_permissive or research_nc_eval_only (evaluation-only NC track, strictly forbidden for training)."
+    },
+    "eval_only": {
+      "type": "boolean",
+      "default": false,
+      "description": "Must be true on research_nc_eval_only track (strictly forbidden for training)."
+    },
+    "created_at": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 UTC timestamp of manifest generation."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional human-readable manifest notes."
+    },
+    "visual_severity_scale": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["V1", "V2", "V3", "V4"] },
+      "uniqueItems": true,
+      "description": "Supported visual severity levels (V1-V4) used across manifest pages."
+    },
+    "phenomena_vocabulary": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Optional list of canonical phenomena_tags tracked in this split."
+    },
+    "pages": {
+      "type": "array",
+      "description": "Ordered list of per-page metadata records.",
+      "items": {
+        "$ref": "page_metadata.schema.json"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "split": { "const": "dev-v1" } },
+        "required": ["split"]
+      },
+      "then": {
+        "required": ["canary"],
+        "properties": {
+          "canary": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "track": { "const": "research_nc_eval_only" } },
+        "required": ["track"]
+      },
+      "then": {
+        "required": ["eval_only"],
+        "properties": {
+          "eval_only": { "const": true }
+        }
+      }
+    }
+  ]
+}

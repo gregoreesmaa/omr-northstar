@@ -10,17 +10,20 @@ import unittest
 from omr_northstar.cli import format_scorecard, main as cli_main, validate_manifest_records
 from omr_northstar.scoring import (
     DOMAINS,
+    TIER_WEIGHTS,
     PageMetrics,
     build_report,
     compute_catastrophic_penalties,
     compute_effective_measure_cost,
     compute_northstar_score,
+    compute_ns_bootstrap_ci,
     compute_ntsr,
     compute_nupr,
     compute_page_quality,
     compute_paired_deltas,
     compute_prior_hallucination_rate,
     compute_stratum_scores,
+    compute_tier_weighted_ns,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -193,7 +196,7 @@ class TestSchemasAndCLI(unittest.TestCase):
     def test_schemas_are_valid_json_draft_2020_12(self) -> None:
         schema_dir = REPO_ROOT / "schemas"
         schema_files = sorted(schema_dir.glob("*.json"))
-        self.assertEqual(len(schema_files), 2)
+        self.assertGreaterEqual(len(schema_files), 2)
         for sf in schema_files:
             data = json.loads(sf.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -260,6 +263,118 @@ class TestSchemasAndCLI(unittest.TestCase):
         bad_rec = dict(valid_rec, domain="UNKNOWN")
         errs = validate_manifest_records([bad_rec])
         self.assertTrue(any("invalid domain" in e for e in errs))
+
+
+class TestBootstrapAndTierWeightedNS(unittest.TestCase):
+    """Verify work-clustered bootstrap ns_ci95, 6-tier weighted NS, and edge cases."""
+
+    def test_work_clustered_bootstrap_ci_deterministic_and_bounded(self) -> None:
+        pages: list[PageMetrics] = []
+        for d_idx, d in enumerate(DOMAINS):
+            for w in range(4):
+                s_val = 0.70 + 0.05 * w - 0.03 * d_idx
+                pages.append(
+                    PageMetrics(
+                        page_id=f"{d}_w{w}_p1",
+                        work_id=f"{d}_w{w}",
+                        domain=d,
+                        tier="T2",
+                        s_note=s_val,
+                        s_struct=s_val,
+                        s_expr=s_val,
+                        s_play=s_val,
+                        wfpp=10.0,
+                        transcribe_cost=100.0,
+                    )
+                )
+        results = [compute_page_quality(p) for p in pages]
+        ci1 = compute_ns_bootstrap_ci(results, n_boot=500, seed=123)
+        ci2 = compute_ns_bootstrap_ci(results, n_boot=500, seed=123)
+        self.assertIsNotNone(ci1)
+        self.assertEqual(ci1, ci2)
+        assert ci1 is not None
+        self.assertLessEqual(ci1[0], ci1[1])
+
+        report = build_report(pages, system_name="boot-test", n_boot=500, bootstrap_seed=123)
+        ns_score = report["layer1_headline"]["ns_score"]
+        ns_ci95 = report["layer1_headline"]["ns_ci95"]
+        self.assertIsInstance(ns_ci95, list)
+        self.assertEqual(len(ns_ci95), 2)
+        self.assertLessEqual(ns_ci95[0], ns_score)
+        self.assertGreaterEqual(ns_ci95[1], ns_score)
+
+    def test_tier_weighted_ns_full_and_subset_renormalization(self) -> None:
+        self.assertAlmostEqual(sum(TIER_WEIGHTS.values()), 1.0, places=9)
+        # Subset with only T0 (Q=100) and T2 (Q=60) -> weights 0.05 and 0.25 -> renorm 1/6 and 5/6
+        p_t0 = PageMetrics("p0", "w0", "CDR", "T0", 1.0, 1.0, 1.0, 1.0, 0.0, 100.0)
+        p_t2 = PageMetrics("p2", "w2", "RWP", "T2", 0.6, 0.6, 0.6, 0.6, 40.0, 100.0)
+        res = [compute_page_quality(p_t0), compute_page_quality(p_t2)]
+        tw_ns = compute_tier_weighted_ns(res)
+        expected = (0.05 / 0.30) * 100.0 + (0.25 / 0.30) * 60.0
+        self.assertAlmostEqual(tw_ns, expected, places=4)
+
+        report = build_report([p_t0, p_t2], system_name="tier-test")
+        self.assertAlmostEqual(report["layer1_headline"]["tier_weighted_ns"], expected, places=4)
+
+    def test_negative_control_non_music_page_safe(self) -> None:
+        # Clean negative-control page (n_gt=0, n_pred=0, m_gt=0, m_pred=0, transcribe_cost=0)
+        clean_blank = PageMetrics(
+            page_id="neg_ok",
+            work_id="w_neg",
+            domain="ALS",
+            tier="T0",
+            s_note=1.0,
+            s_struct=1.0,
+            s_expr=1.0,
+            s_play=1.0,
+            wfpp=0.0,
+            transcribe_cost=0.0,
+            n_gt=0,
+            n_pred=0,
+            m_gt=0,
+            m_pred=0,
+            bsvr=1.0,
+        )
+        res_ok = compute_page_quality(clean_blank)
+        self.assertFalse(res_ok.catastrophic_failure)
+        self.assertNotIn("empty_output", res_ok.cf_reasons)
+        self.assertAlmostEqual(res_ok.ntsr, 1.0)
+        self.assertAlmostEqual(res_ok.q_score, 100.0)
+
+        # Hallucinated music on a non-music negative-control page
+        hallucinated_blank = PageMetrics(
+            page_id="neg_fp",
+            work_id="w_neg2",
+            domain="ALS",
+            tier="T0",
+            s_note=0.0,
+            s_struct=0.0,
+            s_expr=0.0,
+            s_play=0.0,
+            wfpp=12.5,
+            transcribe_cost=0.0,
+            n_gt=0,
+            n_pred=5,
+            m_gt=0,
+            m_pred=2,
+            bsvr=1.0,
+        )
+        res_fp = compute_page_quality(hallucinated_blank)
+        self.assertTrue(res_fp.catastrophic_failure)
+        self.assertIn("hallucination_loop", res_fp.cf_reasons)
+        self.assertIn("structural_collapse", res_fp.cf_reasons)
+        self.assertEqual(res_fp.q_score, 0.0)
+        self.assertLess(res_fp.ntsr, 0.0)
+
+    def test_paired_deltas_groups_duplicate_engravers(self) -> None:
+        pages = [
+            PageMetrics("p1", "w1", "CDR", "T1", 0.90, 0.90, 0.90, 0.90, 10.0, 100.0, paired_anchor_id="a1", engraver="Dorico"),
+            PageMetrics("p2", "w1", "CDR", "T1", 0.94, 0.94, 0.94, 0.94, 6.0, 100.0, paired_anchor_id="a1", engraver="Dorico"),
+            PageMetrics("p3", "w1", "CDR", "T1", 0.82, 0.82, 0.82, 0.82, 18.0, 100.0, paired_anchor_id="a1", engraver="LilyPond"),
+        ]
+        deltas = compute_paired_deltas([compute_page_quality(p) for p in pages])
+        # Dorico mean = 92.0, LilyPond = 82.0 -> spread = 10.0 (not max-min=12.0)
+        self.assertAlmostEqual(deltas["delta_engraver"], 10.0, places=4)
 
 
 if __name__ == "__main__":

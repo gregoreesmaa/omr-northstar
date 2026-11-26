@@ -26,13 +26,13 @@ Each page/piece is parsed into an ordered sequence of **measures** $m \in \{1, \
 
 ### Axis 1: Core Note Accuracy (`S_note`)
 
-Evaluated across a 3-tier diagnostic ladder:
+Evaluated across a 3-level diagnostic ladder:
 
-| Tier | Match Criteria (Exact Rational Time) | Diagnostic Purpose |
+| Match Level | Match Criteria (Exact Rational Time) | Diagnostic Purpose |
 |---|---|---|
-| **T1a: Sounding** | MIDI pitch $p \in [0, 127]$ + measure-relative onset $t$ | Basic pitch/onset detection |
-| **T1b: Rhythmic** | T1a + written duration $d$ (plus grace/tuplet flag) | Rhythm & duration fidelity |
-| **T1c: Strict Engraving (Headline)** | T1b + exact diatonic spelling `(step, alter, octave)` + staff assignment + voice class under optimal $\pi$ + chord/cue flags | True engraving-grade note accuracy |
+| **L1a: Sounding** | MIDI pitch $p \in [0, 127]$ + measure-relative onset $t$ | Basic pitch/onset detection |
+| **L1b: Rhythmic** | L1a + written duration $d$ (plus grace/tuplet flag) | Rhythm & duration fidelity |
+| **L1c: Strict Engraving (Headline)** | L1b + exact diatonic spelling `(step, alter, octave)` + staff assignment + voice class under optimal $\pi$ + chord/cue flags | True engraving-grade note accuracy |
 
 $$S_{\text{note}}(P) = F1_{\text{strict}}(P) = \frac{2\,|M_{\text{strict}}|}{|N_{\text{pred}}| + |N_{\text{gt}}|}$$
 
@@ -45,7 +45,7 @@ Secondary diagnostics logged alongside `S_note`: Conditional Spelling Accuracy (
 3. **Beat-Sum Validity Rate (`BSVR`):** Fraction of predicted `(measure, staff, voice)` streams whose rational duration sum equals the active time signature (exempting GT-annotated anacruses, cadenzas, and mid-measure repeats).
 4. **Active Context State Accuracy (`A_state`):** Evaluated at *every matched note onset* for exact equality of active `(clef, key_sig, time_sig, ottava)`.
 5. **Repeat / Volta Roadmap Similarity (`A_road`):** Unroll GT and predicted repeat roadmaps into measure sequences $R_{\text{gt}}, R_{\text{pred}}$; score via $1 - \frac{\text{Lev}(R_{\text{pred}}, R_{\text{gt}})}{\max(|R_{\text{pred}}|, |R_{\text{gt}}|)}$.
-6. **Multi-System / Multi-Page Continuity (`S_cont`):** F1 over part-to-staff grouping and cross-system ties/slurs/hairpins.
+6. **Multi-System / Multi-Page Continuity (`S_cont`):** F1 over part-to-staff grouping and cross-system/cross-page ties, slurs, hairpins, and ottavas.
 
 $$S_{\text{struct}}(P) = 0.25\,\text{MER} + 0.20\,F1_{\text{bar}} + 0.15\,\text{BSVR} + 0.20\,A_{\text{state}} + 0.10\,A_{\text{road}} + 0.10\,S_{\text{cont}}$$
 
@@ -58,18 +58,18 @@ Category-macro-averaged F1 across 5 non-note layers:
 2. **Articulations & Ornaments (`F1_art`):** Staccato, accent, tenuto, marcato, fermata, trill, mordent, turn, arpeggio, breath mark.
 3. **Dynamics & Hairpins (`F1_dyn`):** Point dynamics within $\pm \frac{1}{8}$ beat; hairpins matched on type + span $\text{IoU} \ge 0.70$.
 4. **Slurs & Ties (`F1_slur`):** Ties matched strictly on `(start_note, end_note)`; slurs matched on `(staff, start_onset, end_onset)` with span $\text{IoU} \ge 0.75$.
-5. **Textual & Symbolic Layers (`F1_text`):** Lyrics (syllable $1 - \text{CER}$), chord symbols `(root, quality, extensions, bass)`, and tempo/metronome/rehearsal marks.
+5. **Textual & Symbolic Layers (`F1_text`):** Lyrics (Unicode NFC-normalized syllable $1 - \text{CER}$ across Latin, Cyrillic, CJK, Greek, and RTL Hebrew), chord symbols & Nashville numerals `(root, quality, extensions, bass)`, harp pedaling, and tempo/metronome/rehearsal marks.
 
 $$S_{\text{expr}}(P) = \frac{1}{|\mathcal{C}_{\text{active}}(P)|} \sum_{c \in \mathcal{C}_{\text{active}}(P)} F1_c(P)$$
 
 ### Axis 4: Playability vs. Engraving Fidelity (`S_play` vs. `S_eng`)
 
 - **Playability Score (`S_play`):** Render both GT and prediction through a deterministic reference performance engine (expanding repeats/voltas, resolving ties, applying key signatures, accidentals, and ottavas) and compute unrolled sounding MIDI-event F1 on `(midi_pitch, unrolled_beat_onset, sounding_duration)`.
-- **Engraving–Playability Gap (`Δ = S_play - S_eng`):** Exposes models that sound acceptable in MIDI while producing unusable notation.
+- **Engraving–Playability Gap ($\Delta_{\text{play-eng}} = S_{\text{play}} - S_{\text{eng}}$, where $S_{\text{eng}} \equiv S_{\text{note}}$):** Exposes models that sound acceptable in MIDI while producing unusable notation (wrong enharmonic spelling, merged voices, omitted key signatures).
 
 ---
 
-## 2. Human-Utility & Product Metrics
+## 2. Human-Utility, Catastrophic Failure & Negative-Control Metrics
 
 ### 2.1 Weighted Fixes Per Page (`wFPP`) & Root-Cause Bulk-Repair Factoring
 
@@ -77,13 +77,13 @@ We compute a **minimum-cost editor script** transforming prediction → GT in a 
 
 **Root-Cause Bulk-Repair Factoring:** Before counting per-note edits, the scorer evaluates bulk structural repairs (fixing a wrong clef + diatonic span shift; fixing a key signature + respelling accidentals; inserting/deleting a barline + re-barring) and takes the minimum of `(bulk structural fix + residual note fixes)` vs. `(individual note fixes)`.
 
-| Cost Tier | `NEU` | Representative Notation-Editor Operations |
+| Edit Cost Level | `NEU` | Representative Notation-Editor Operations |
 |---|---:|---|
-| **T0: Micro** | 0.5 | Add/delete/change staccato, accent, tenuto, fermata, dynamic mark, tie toggle |
-| **T1: Atomic** | 1.0 | Fix single note pitch, accidental/enharmonic respell, duration tweak (no reflow), slur endpoint adjust, lyric syllable edit, chord symbol edit |
-| **T2: Local Structural** | 2.5 | Insert/delete note or rest (cursor + rhythm + pitch), reassign note voice/staff, fix tuplet bracket |
-| **T3: Measure/Context Structural** | 5.0 | Insert/delete barline + re-bar, fix clef/key/time change (+ bulk span shift), fix repeat/volta bracket |
-| **T4: System Structural** | 12.0 | Fix merged/split grand staff, repair part/instrument bracket across system break |
+| **E0: Micro** | 0.5 | Add/delete/change staccato, accent, tenuto, fermata, dynamic mark, tie toggle |
+| **E1: Atomic** | 1.0 | Fix single note pitch, accidental/enharmonic respell, duration tweak (no reflow), slur endpoint adjust, lyric syllable edit, chord symbol edit |
+| **E2: Local Structural** | 2.5 | Insert/delete note or rest (cursor + rhythm + pitch), reassign note voice/staff, fix tuplet bracket |
+| **E3: Measure/Context Structural** | 5.0 | Insert/delete barline + re-bar, fix clef/key/time change (+ bulk span shift), fix repeat/volta bracket |
+| **E4: System Structural** | 12.0 | Fix merged/split grand staff, repair part/instrument bracket across system break |
 
 ### 2.2 Rational Musician Re-Entry Cap & Net Time Saved Ratio (`NTSR`)
 
@@ -91,7 +91,7 @@ For every measure $m$, edit cost is capped at full manual re-entry:
 
 $$\text{Cost}_{\text{eff}}(m) = \min\!\Big(\text{EditCost}(\hat{m} \to m),\; c_{\text{clear}} + \text{TranscribeCost}(m)\Big), \qquad c_{\text{clear}} = 1.5\text{ NEU}$$
 
-Summed over page $P$:
+Summed over page $P$ (for music pages with $\text{TranscribeCost}(P) > 0$):
 - **Weighted Fixes Per Page:** $\text{wFPP}(P) = \sum_{m \in P} \text{Cost}_{\text{eff}}(m)$ (plus density-normalized `wFP100N` = NEU per 100 GT notes).
 - **Net Time Saved Ratio:**
   $$\text{NTSR}(P) = 1 - \frac{\text{wFPP}(P)}{\text{TranscribeCost}(P)} \in (-\infty, 1]$$
@@ -101,14 +101,27 @@ Summed over page $P$:
 
 ### 2.3 Catastrophic Failure Penalties & Rate (`CFR`)
 
-A page triggers a **Catastrophic Failure** flag (`CF = 1`) if *any* of the following occur:
+A core music page ($N_{\text{gt}} > 0$) triggers a **Catastrophic Failure** flag (`CF = 1`) if *any* of the following occur:
 1. **Unparseable / Schema-Invalid Output:** Fails reference MusicXML/MEI parser $\implies Q(P) = 0$, $\text{wFPP}(P) = 1.2 \cdot \text{TranscribeCost}(P)$.
 2. **Skipped / Empty Page:** $N_{\text{pred}} = 0$ when $N_{\text{gt}} > 0 \implies Q(P) = 0$.
 3. **Dropped System(s):** Any GT system has note recall `< 15%`. Applies multiplicative penalty $0.85^{k_{\text{dropped}}}$ to $Q(P)$.
 4. **Hallucination / Repetition Loop:** $N_{\text{pred}} > 1.5 \cdot N_{\text{gt}}$ on a page, OR a predicted measure $n$-gram ($n \ge 2$) repeats $\ge 3\times$ consecutively when absent in GT. Applies penalty $\text{LoopPen}(P) = \min\!\big(1,\, \frac{1.5\,N_{\text{gt}}}{\max(N_{\text{pred}}, 1)}\big)$.
 5. **Structural Collapse:** Page $\text{BSVR} < 0.50$ OR $|M_{\text{pred}} - M_{\text{gt}}| / M_{\text{gt}} > 0.25$.
 
-Report $\text{CFR}_s$ per domain stratum and $\text{CFR}_{\max} = \max_s \text{CFR}_s$.
+Report $\text{CFR}_s$ per domain stratum, $\text{CFR}_{\max} = \max_s \text{CFR}_s$, and $\text{CFR}_t$ per complexity tier.
+
+### 2.4 Negative-Control Gate (`NC-Gate`) — Handling `n_gt = 0` Pages Without Division by Zero
+
+The **40 negative-control pages** (`16 dev-v1 / 24 test-v1`; see `docs/05-adversarial-stress-tests.md` Family `3B`) include non-music pages (title pages, text libretti, tables/diagrams, blank manuscript staff paper) where $N_{\text{gt}} = 0$ and $\text{TranscribeCost}(P) = 0$.
+
+- **Strict Exclusion from `Q(P)` / `NS` Averaging:** Pages with $N_{\text{gt}} = 0$ are **never** fed into `compute_page_quality` or `NTSR(P)` (avoiding `0/0` undefined F1 and division by zero in `TranscribeCost`).
+- **Dedicated Negative-Control Metrics:** Let $\mathcal{N}_0$ be the set of $N_{\text{gt}} = 0$ negative-control pages in the split:
+  - **Total Negative-Control False-Positive Notes:** $\text{NC\_FP} = \sum_{P \in \mathcal{N}_0} N_{\text{pred}}(P)$ (recorded in `report.json` under `layer2_matrix_and_deltas.adversarial_scorecard.non_music_fp_count`).
+  - **Non-Music Hallucination Rate:** $\text{NMHR} = \frac{|\{P \in \mathcal{N}_0 : N_{\text{pred}}(P) > 0\}|}{|\mathcal{N}_0|}$.
+  - **Two-Page Spread Ordering Accuracy:** Fraction of 2-page spread controls where left-page systems strictly precede right-page systems without horizontal cross-gutter merging.
+- **Leaderboard Eligibility Gate:**
+  - **PASS (Verified Leaderboard Status):** $\text{NMHR} = 0\%$ ($\text{NC\_FP} = 0$) **and** Two-Page Spread Ordering Accuracy $= 100\%$.
+  - **FAIL (`[NC-FAIL]`):** Any submission with $\text{NC\_FP} > 0$ or spread-ordering failure is flagged `[NC-FAIL]` on the public leaderboard, ineligible for Verified Leaderboard Status, and reported with an explicit penalty-adjusted diagnostic $NS_{\text{nc}} = NS \cdot (1 - 0.25 \cdot \text{NMHR})$ alongside raw $NS$.
 
 ---
 
@@ -124,23 +137,35 @@ All `ALS` and `HWM` test pieces undergo dual-independent human transcription + 3
 
 ---
 
-## 4. Composite North Star Score (`NS`)
+## 4. Canonical Composite North Star Score (`NS`) & Companion Tier-Weighted `NS_tier`
 
-### Per-Page Quality Score $Q(P) \in [0, 100]$
+### 4.1 Per-Page Quality Score $Q(P) \in [0, 100]$ (`40 / 25 / 20 / 15` Canonical Weights)
 
 $$Q_{\text{raw}}(P) = 100 \cdot \Big( 0.40\,S_{\text{note}}(P) + 0.25\,S_{\text{struct}}(P) + 0.20\,S_{\text{expr}}(P) + 0.15\,\max\big(0,\, \text{NTSR}(P)\big) \Big)$$
 
 $$Q(P) = Q_{\text{raw}}(P) \cdot \mathbb{I}[\text{parseable} \land \neg\text{empty}] \cdot (0.85)^{k_{\text{dropped\_sys}}} \cdot \text{LoopPen}(P)$$
 
-Each domain stratum score $Q_s$ ($s \in \{\text{CDR}, \text{ALS}, \text{RWP}, \text{HWM}\}$) is the **piece-level macro-average** of $Q(P)$, reported with 95% piece-level cluster-bootstrap confidence intervals.
+Each domain stratum score $Q_s$ ($s \in \{\text{CDR}, \text{ALS}, \text{RWP}, \text{HWM}\}$) is the **work-level macro-average** of $Q(P)$, reported with 95% work-clustered bootstrap confidence intervals (1,000 resamples).
 
-### Cross-Domain Composite (`NS`)
+### 4.2 Primary Headline Cross-Domain Composite (`NS`)
 
 $$M_{\text{geom}} = \left(\prod_{s \in \mathcal{D}} \max(Q_s,\, 0.1)\right)^{1/4}$$
 
 $$NS = \Big( 0.75\,M_{\text{geom}} + 0.25\,\min_{s \in \mathcal{D}} Q_s \Big) \cdot \Big(1 - 0.50\,\max_{s \in \mathcal{D}} \text{CFR}_s\Big)$$
 
-### Calibration Examples (Verified in `tests/test_scoring.py`)
+### 4.3 Official Companion Tier-Weighted North Star Score (`NS_tier`)
+
+To track frontier progress across musical complexity independently of visual domain, every evaluation also reports the **6-Tier Weighted North Star (`NS_tier`)**. Let $Q_t$ be the work-level macro-average of $Q(P)$ and $\text{CFR}_t$ the page-level Catastrophic Failure Rate for each complexity tier $t \in \mathcal{T} = \{T0, T1, T2, T3, T4, T5\}$, weighted by:
+
+$$w_t = \big\{\, T0: 0.05,\;\; T1: 0.15,\;\; T2: 0.25,\;\; T3: 0.25,\;\; T4: 0.18,\;\; T5: 0.12 \,\big\}, \qquad \sum_{t \in \mathcal{T}} w_t = 1.00$$
+
+$$M_{\text{tier,geom}} = \prod_{t \in \mathcal{T}} \max(Q_t,\, 0.1)^{w_t}$$
+
+$$NS_{\text{tier}} = \Big( 0.75\,M_{\text{tier,geom}} + 0.25\,\min_{t \in \mathcal{T}} Q_t \Big) \cdot \Big(1 - 0.50\,\max_{t \in \mathcal{T}} \text{CFR}_t\Big)$$
+
+Missing complexity tiers score $Q_t = 0.0$ and $\text{CFR}_t = 1.0$, enforcing the same full-matrix anti-gaming guarantee across musical complexity as `NS` enforces across visual domains.
+
+### 4.4 Calibration Examples for Primary `NS` (Verified in `tests/test_scoring.py`)
 
 | System Profile | `(CDR, ALS, RWP, HWM)` | `CFR_max` | `M_geom` | `NS` |
 |---|---|---:|---:|---:|
