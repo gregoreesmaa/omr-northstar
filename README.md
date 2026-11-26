@@ -22,6 +22,7 @@ homr 0.7.1              ██████░░░░░░░░░░░░�
 Audiveris 5.11.0        █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   2.81
 Qwen2.5-VL-7B (VLM)     █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   1.57
 SMT++ (GrandStaff)      █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   1.26
+oemer 0.1.8             █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.79
                         0        25        50        75       100
                         Composite NorthStar Score (NS, 0–100)
 ```
@@ -35,12 +36,13 @@ SMT++ (GrandStaff)      █░░░░░░░░░░░░░░░░░�
 | **Audiveris** `5.11.0` *(AGPL-3.0)* | **2.81** `[1.49, 3.80]` | 72.07 | 2.15 | 33.60 | 0.55 | +0.161 | PASS (0.0%) |
 | **Qwen2.5-VL-7B** *(Apache-2.0)* | **1.57** `[0.98, 2.02]` | 13.22 | 1.73 | 1.56 | 5.01 | -9.509 | PASS (0.0%) |
 | **SMT++** `smt-fp-grandstaff` *(MIT)* | **1.26** `[0.58, 1.92]` | 11.73 | 4.02 | 5.32 | 0.43 | -0.351 | PASS (0.0%) |
+| **oemer** `0.1.8` *(MIT)* | **0.79** `[0.41, 1.05]` | 10.68 | 1.26 | 1.96 | 0.52 | -0.191 | PASS (0.0%) |
 
 **What the numbers actually show:**
 - **Print tools break outside the lab:** `Audiveris` (`72.07`) and `homr` (`60.76`) read clean digital scores reasonably well, but suffer `92.9%`–`100.0%` catastrophic failure rates on real handwritten manuscripts and up to `100.0%` on archival scans.
 - **General VLMs hallucinate fluency:** `Qwen2.5-VL-7B-Instruct` outputs parseable notation on `81.6%` of pages, yet gets the actual notes wrong (`S_note = 0.0336`) and loops so badly that fixing its output takes **~10× longer than retyping by hand** (`mean_NTSR = -9.509`).
 - **Narrow neural specialists don't generalize:** `SMT++` (`PRAIG/smt-fp-grandstaff`, trained on printed piano GrandStaff) fails `**kern` parsing on `70.4%` of non-GrandStaff, degraded, and handwritten pages.
-- **Zero false music on blank/text pages:** All four baselines pass `4/4` non-music negative controls (`0.0%` hallucination rate). *(`oemer 0.1.8` is currently running and will be added upon completion.)*
+- **Zero false music on blank/text pages:** All five baselines pass `4/4` non-music negative controls (`0.0%` hallucination rate). *(Upcoming public baselines: `Clarity-OMR`, `OmniOMR/Zeus`, and `Score-Reader` are currently queued/running.)*
 
 <details>
 <summary><strong>Full 12-column metrics, failure rates (CFR), and evaluation protocol</strong></summary>
@@ -54,8 +56,9 @@ Scored with the canonicalized `omr-northstar` CER reference evaluator (`89c698c`
 | **Audiveris** | `5.11.0` / AGPL-3.0 | **2.81** `[1.49, 3.80]` | 11.90 | 72.07 (22.9%) | 2.15 (100.0%) | 33.60 (67.7%) | 0.55 (100.0%) | 0.3379 | 0.1896 | +0.161 | 0.0% |
 | **Qwen2.5-VL-7B-Instruct** *(VLM)* | `7B` / Apache-2.0 | **1.57** `[0.98, 2.02]` | 3.49 | 13.22 (85.7%) | 1.73 (100.0%) | 1.56 (100.0%) | 5.01 (100.0%) | 0.0336 | 0.0401 | -9.509 | 0.0% |
 | **SMT++** (`smt-fp-grandstaff`) | `10.9M` / MIT | **1.26** `[0.58, 1.92]` | 2.55 | 11.73 (97.1%) | 4.02 (90.3%) | 5.32 (93.6%) | 0.43 (100.0%) | 0.0635 | 0.0537 | -0.351 | 0.0% |
+| **oemer** | `0.1.8` / MIT | **0.79** `[0.41, 1.05]` | 3.09 | 10.68 (97.1%) | 1.26 (100.0%) | 1.96 (100.0%) | 0.52 (100.0%) | 0.0467 | 0.0412 | -0.191 | 0.0% |
 
-- **Hardware & Isolation:** `homr 0.7.1` and `Audiveris 5.11.0` ran in offline Docker/CPU isolation. `Qwen2.5-VL-7B-Instruct` (deterministic BF16 greedy ABC prompting + `music21` conversion) and `SMT++` (`PRAIG/smt-fp-grandstaff` `**kern` + `music21` conversion) ran on a single NVIDIA L4 GPU (24 GB VRAM).
+- **Hardware & Isolation:** `homr 0.7.1`, `Audiveris 5.11.0`, and `oemer 0.1.8` ran in offline Docker/CPU isolation. `Qwen2.5-VL-7B-Instruct` (deterministic BF16 greedy ABC prompting + `music21` conversion) and `SMT++` (`PRAIG/smt-fp-grandstaff` `**kern` + `music21` conversion) ran on a single NVIDIA L4 GPU (24 GB VRAM).
 - **v0.1 Pilot Caveat:** In v0.1, `ALS` and `RWP` are pilot degradations derived from the `CDR` anchors pending full physical flatbed scanning and smartphone capture for v1.0; `HWM` contains real historical handwritten manuscripts.
 
 </details>
