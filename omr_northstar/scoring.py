@@ -38,6 +38,22 @@ ERROR_BUCKET_KEYS: tuple[str, ...] = (
 )
 
 
+def _require_finite(name: str, value: float) -> float:
+    """Validate that a numeric value is finite (not NaN or Inf)."""
+    fval = float(value)
+    if not math.isfinite(fval):
+        raise ValueError(f"{name} must be finite, got {value!r}.")
+    return fval
+
+
+def _require_unit_interval(name: str, value: float) -> float:
+    """Validate that a numeric value is finite and in [0.0, 1.0]."""
+    fval = _require_finite(name, value)
+    if not (0.0 <= fval <= 1.0):
+        raise ValueError(f"{name} must be in [0.0, 1.0], got {value!r}.")
+    return fval
+
+
 @dataclass(frozen=True)
 class PageMetrics:
     """Per-page evaluation metrics extracted from CER alignment."""
@@ -64,6 +80,20 @@ class PageMetrics:
     engraver: str | None = None
     error_buckets: Mapping[str, float] | None = None
     latency_s: float | None = None
+
+    def __post_init__(self) -> None:
+        _require_finite("s_note", self.s_note)
+        _require_finite("s_struct", self.s_struct)
+        _require_finite("s_expr", self.s_expr)
+        _require_finite("s_play", self.s_play)
+        _require_finite("wfpp", self.wfpp)
+        _require_finite("transcribe_cost", self.transcribe_cost)
+        _require_finite("bsvr", self.bsvr)
+        if self.latency_s is not None:
+            _require_finite("latency_s", self.latency_s)
+        if self.error_buckets is not None:
+            for k, v in self.error_buckets.items():
+                _require_finite(f"error_buckets[{k!r}]", v)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "PageMetrics":
@@ -130,6 +160,9 @@ def compute_effective_measure_cost(
 
     Cost_eff(m) = min(EditCost(m_hat -> m), c_clear + TranscribeCost(m))
     """
+    edit_cost = _require_finite("edit_cost", edit_cost)
+    transcribe_cost = _require_finite("transcribe_cost", transcribe_cost)
+    clear_cost = _require_finite("clear_cost", clear_cost)
     if edit_cost < 0 or transcribe_cost < 0 or clear_cost < 0:
         raise ValueError("Costs must be non-negative.")
     return min(edit_cost, clear_cost + transcribe_cost)
@@ -142,6 +175,8 @@ def compute_ntsr(wfpp: float, transcribe_cost: float) -> float:
       - wfpp == 0 -> 1.0 (zero false-positive edits)
       - wfpp > 0  -> -wfpp (strictly negative utility)
     """
+    wfpp = _require_finite("wfpp", wfpp)
+    transcribe_cost = _require_finite("transcribe_cost", transcribe_cost)
     if wfpp < 0:
         raise ValueError("wfpp must be non-negative.")
     if transcribe_cost < 0:
@@ -155,8 +190,9 @@ def compute_nupr(ntsr_values: Sequence[float]) -> float:
     """Negative-Utility Page Rate: fraction of pages with NTSR <= 0."""
     if not ntsr_values:
         return 0.0
-    neg = sum(1 for v in ntsr_values if v <= 0.0)
-    return neg / len(ntsr_values)
+    vals = [_require_finite("ntsr", v) for v in ntsr_values]
+    neg = sum(1 for v in vals if v <= 0.0)
+    return neg / len(vals)
 
 
 def compute_catastrophic_penalties(
@@ -171,16 +207,19 @@ def compute_catastrophic_penalties(
         raise ValueError("k_dropped_systems must be non-negative.")
     if page.n_gt < 0 or page.n_pred < 0 or page.m_gt < 0 or page.m_pred < 0:
         raise ValueError("Note and measure counts must be non-negative.")
+    _require_unit_interval("bsvr", page.bsvr)
+
+    # 1. Unparseable / schema-invalid output (short-circuit to avoid cascading CF flags)
+    if not page.parseable:
+        effective_wfpp = max(
+            1.2 * page.transcribe_cost,
+            1.5 if page.transcribe_cost == 0.0 else 0.0,
+        )
+        return (True, ("unparseable",), 0.0, effective_wfpp)
 
     reasons: list[str] = []
     mult = 1.0
     effective_wfpp = page.wfpp
-
-    # 1. Unparseable / schema-invalid output
-    if not page.parseable:
-        reasons.append("unparseable")
-        mult = 0.0
-        effective_wfpp = max(1.2 * page.transcribe_cost, 1.5 if page.transcribe_cost == 0.0 else 0.0)
 
     # 2. Skipped / empty page (only when GT actually contains music)
     if page.n_gt > 0 and page.n_pred == 0:
@@ -192,22 +231,25 @@ def compute_catastrophic_penalties(
         reasons.append("dropped_system")
         mult *= 0.85 ** page.k_dropped_systems
 
-    # 4. Hallucination / repetition loop (also catches music hallucinated on non-music n_gt == 0 pages)
+    # 4. Hallucination / repetition loop
+    #    On non-music pages (n_gt == 0 and m_gt == 0), any predicted note triggers hard CF.
+    #    On tacet music pages (n_gt == 0 and m_gt > 0), only an explicit repetition loop triggers hard CF.
     over_predicted = (
         (page.n_gt > 0 and page.n_pred > 1.5 * page.n_gt)
-        or (page.n_gt == 0 and page.n_pred > 0)
+        or (page.n_gt == 0 and page.m_gt == 0 and page.n_pred > 0)
     )
     if over_predicted or page.has_repetition_loop:
         reasons.append("hallucination_loop")
         if page.n_gt > 0:
             loop_pen = min(1.0, (1.5 * page.n_gt) / max(page.n_pred, 1))
             mult *= loop_pen
-        elif page.n_pred > 0:
+        elif (page.m_gt == 0 or page.has_repetition_loop) and page.n_pred > 0:
             mult = 0.0
 
-    # 5. Structural collapse (safe when m_gt == 0 and m_pred == 0 on non-music pages)
+    # 5. Structural collapse (safe when m_gt == 0 and m_pred == 0 on non-music pages;
+    #    1-bar tolerance on very short 2-3 bar excerpts via max(1, 0.25 * m_gt))
     measure_ratio_bad = (
-        (page.m_gt > 0 and abs(page.m_pred - page.m_gt) / page.m_gt > 0.25)
+        (page.m_gt > 0 and abs(page.m_pred - page.m_gt) > max(1, 0.25 * page.m_gt))
         or (page.m_gt == 0 and page.m_pred > 0)
     )
     is_clean_non_music = (
@@ -221,12 +263,18 @@ def compute_catastrophic_penalties(
 
 def compute_page_quality(page: PageMetrics) -> PageScoreResult:
     """Compute per-page quality Q(P) in [0, 100] with catastrophic penalties."""
+    s_note = _require_unit_interval("s_note", page.s_note)
+    s_struct = _require_unit_interval("s_struct", page.s_struct)
+    s_expr = _require_unit_interval("s_expr", page.s_expr)
+    _require_unit_interval("s_play", page.s_play)
+    _require_unit_interval("bsvr", page.bsvr)
+
     is_cf, reasons, mult, effective_wfpp = compute_catastrophic_penalties(page)
     ntsr = compute_ntsr(effective_wfpp, page.transcribe_cost)
     q_raw = 100.0 * (
-        0.40 * page.s_note
-        + 0.25 * page.s_struct
-        + 0.20 * page.s_expr
+        0.40 * s_note
+        + 0.25 * s_struct
+        + 0.20 * s_expr
         + 0.15 * max(0.0, ntsr)
     )
     q_raw = max(0.0, min(100.0, q_raw))
@@ -318,27 +366,56 @@ def compute_tier_scores(
 def compute_tier_weighted_ns(
     page_results: Sequence[PageScoreResult],
     tier_weights: Mapping[str, float] = TIER_WEIGHTS,
+    *,
+    strict_missing_tiers: bool = False,
 ) -> float:
-    """Compute 6-tier weighted North Star breakdown renormalized over active tiers.
+    """Compute 6-tier weighted North Star (Spec Section 4.3).
 
-    Uses weights T0: 0.05, T1: 0.15, T2: 0.25, T3: 0.25, T4: 0.18, T5: 0.12
-    renormalized over tiers present in `page_results`, damped by
-    (1 - 0.50 * max_active_tier CFR_t).
+    M_tier_geom = prod_{t in T} max(Q_t, 0.1)^{w_t}
+    NS_tier = (0.75 * M_tier_geom + 0.25 * min_t Q_t) * (1 - 0.50 * max_t CFR_t)
+
+    Uses weights T0: 0.05, T1: 0.15, T2: 0.25, T3: 0.25, T4: 0.18, T5: 0.12.
+    - When `strict_missing_tiers=True`, missing complexity tiers score Q_t = 0.0 and
+      CFR_t = 1.0 (full-matrix anti-gaming guarantee).
+    - When `strict_missing_tiers=False` (default for partial/dev splits), weights are
+      renormalized over active tiers present in `page_results`.
+    When all 6 tiers are present, both modes produce the exact Spec 4.3 value.
     """
     tier_scores, tier_cfr = compute_tier_scores(page_results)
-    active = [t for t in TIERS if tier_scores[t] is not None]
-    if not active:
-        return 0.0
-    total_w = sum(float(tier_weights[t]) for t in active)
+    if strict_missing_tiers:
+        selected = list(TIERS)
+        q_by_tier = {
+            t: max(0.0, min(100.0, float(tier_scores[t]))) if tier_scores[t] is not None else 0.0
+            for t in selected
+        }
+        cfr_by_tier = {
+            t: max(0.0, min(1.0, float(tier_cfr[t]))) if tier_cfr[t] is not None else 1.0
+            for t in selected
+        }
+    else:
+        selected = [t for t in TIERS if tier_scores[t] is not None]
+        if not selected:
+            return 0.0
+        q_by_tier = {
+            t: max(0.0, min(100.0, float(tier_scores[t])))  # type: ignore[arg-type]
+            for t in selected
+        }
+        cfr_by_tier = {
+            t: max(0.0, min(1.0, float(tier_cfr[t])))  # type: ignore[arg-type]
+            for t in selected
+        }
+
+    total_w = sum(_require_finite(f"tier_weights[{t!r}]", tier_weights[t]) for t in selected)
     if total_w <= 0.0:
         return 0.0
-    weighted_q = sum(
-        (float(tier_weights[t]) / total_w) * float(tier_scores[t])  # type: ignore[arg-type]
-        for t in active
-    )
-    cfr_max = max(float(tier_cfr[t]) for t in active)  # type: ignore[arg-type]
-    cfr_max = max(0.0, min(1.0, cfr_max))
-    return weighted_q * (1.0 - 0.50 * cfr_max)
+
+    m_tier_geom = 1.0
+    for t in selected:
+        w_norm = float(tier_weights[t]) / total_w
+        m_tier_geom *= max(q_by_tier[t], 0.1) ** w_norm
+    worst_q = min(q_by_tier.values())
+    cfr_max = max(0.0, min(1.0, max(cfr_by_tier.values())))
+    return (0.75 * m_tier_geom + 0.25 * worst_q) * (1.0 - 0.50 * cfr_max)
 
 
 def compute_northstar_score(
@@ -350,8 +427,14 @@ def compute_northstar_score(
     M_geom = (prod_{s in D} max(Q_s, 0.1))^(1/4)
     NS = (0.75 * M_geom + 0.25 * min_s Q_s) * (1 - 0.50 * max_s CFR_s)
     """
-    q_vals = [float(stratum_scores.get(d, 0.0)) for d in DOMAINS]
-    cfr_vals = [float(stratum_cfr.get(d, 1.0)) for d in DOMAINS]
+    q_vals = [
+        max(0.0, min(100.0, _require_finite(f"stratum_scores[{d!r}]", stratum_scores.get(d, 0.0))))
+        for d in DOMAINS
+    ]
+    cfr_vals = [
+        _require_finite(f"stratum_cfr[{d!r}]", stratum_cfr.get(d, 1.0))
+        for d in DOMAINS
+    ]
 
     prod = 1.0
     for q in q_vals:
@@ -512,6 +595,26 @@ def compute_prior_hallucination_rate(
     return predicted_as_original_count / mutated_sites_total
 
 
+def compute_negative_control_metrics(
+    neg_pages: Sequence[PageMetrics],
+) -> dict[str, Any]:
+    """Compute dedicated Negative-Control Gate (NC-Gate) metrics (Spec Section 2.4).
+
+    A negative-control page (n_gt == 0 and m_gt == 0) fails if n_pred > 0 or m_pred > 0
+    (catching rest-only hallucinations as well as note hallucinations).
+    """
+    n_pages = len(neg_pages)
+    nc_fp = sum(p.n_pred for p in neg_pages)
+    failed = sum(1 for p in neg_pages if p.n_pred > 0 or p.m_pred > 0)
+    nmhr = (failed / n_pages) if n_pages > 0 else 0.0
+    return {
+        "n_pages": n_pages,
+        "nc_fp": nc_fp,
+        "nmhr": nmhr,
+        "nc_pass": failed == 0,
+    }
+
+
 def _percentile(sorted_vals: Sequence[float], p: float) -> float:
     if not sorted_vals:
         return 0.0
@@ -536,13 +639,31 @@ def build_report(
     n_boot: int = 1000,
     bootstrap_seed: int = 42,
 ) -> dict[str, Any]:
-    """Build a canonical 4-layer report.json dictionary."""
-    results = [compute_page_quality(p) for p in pages]
+    """Build a canonical 4-layer report.json dictionary.
+
+    Negative-control pages (n_gt == 0 and m_gt == 0) are strictly excluded from
+    Q(P), NS, stratum scores, tier_weighted_ns, axes_macro, and human_utility,
+    and are scored separately under `nc_gate` (Spec Section 2.4).
+    """
+    neg_pages = [p for p in pages if p.n_gt == 0 and p.m_gt == 0]
+    music_pages = [p for p in pages if not (p.n_gt == 0 and p.m_gt == 0)]
+
+    results = [compute_page_quality(p) for p in music_pages]
     stratum_scores, stratum_cfr = compute_stratum_scores(results)
     ns = compute_northstar_score(stratum_scores, stratum_cfr)
     ns_ci = compute_ns_bootstrap_ci(results, n_boot=n_boot, seed=bootstrap_seed)
     tier_weighted_ns = compute_tier_weighted_ns(results)
     paired_deltas = compute_paired_deltas(results)
+
+    nc_metrics = compute_negative_control_metrics(neg_pages)
+    ns_nc = ns.ns_score * (1.0 - 0.25 * nc_metrics["nmhr"])
+    nc_gate = {
+        "n_pages": nc_metrics["n_pages"],
+        "nc_fp": nc_metrics["nc_fp"],
+        "nmhr": round(nc_metrics["nmhr"], 4),
+        "nc_pass": nc_metrics["nc_pass"],
+        "ns_nc": round(ns_nc, 4),
+    }
 
     n = len(results)
     if n > 0:
@@ -561,7 +682,7 @@ def build_report(
         s_note_m = s_struct_m = s_expr_m = s_play_m = 0.0
         median_wfpp = p90_wfpp = p99_wfpp = mean_ntsr = nupr = 0.0
 
-    # Layer 2: 6x4 matrix
+    # Layer 2: 6x4 matrix (music pages only)
     matrix: dict[str, dict[str, dict[str, Any]]] = {}
     for t in TIERS:
         matrix[t] = {}
@@ -577,20 +698,25 @@ def build_report(
             else:
                 matrix[t][d] = {"mean_q": None, "median_wfpp": None, "count": 0}
 
-    # Layer 3: 8-bucket error taxonomy (mean across pages that report buckets)
+    # Layer 3: 8-bucket error taxonomy (mean across pages with non-zero error mass)
     bucket_sums: dict[str, float] = {k: 0.0 for k in ERROR_BUCKET_KEYS}
     bucket_counts = 0
     for r in results:
         if r.page.error_buckets:
-            bucket_counts += 1
-            for k in ERROR_BUCKET_KEYS:
-                bucket_sums[k] += float(r.page.error_buckets.get(k, 0.0))
+            page_vals = {
+                k: float(r.page.error_buckets.get(k, 0.0))
+                for k in ERROR_BUCKET_KEYS
+            }
+            if sum(page_vals.values()) > 0.0:
+                bucket_counts += 1
+                for k in ERROR_BUCKET_KEYS:
+                    bucket_sums[k] += page_vals[k]
     layer3 = {
         k: round(bucket_sums[k] / bucket_counts, 4) if bucket_counts > 0 else 0.0
         for k in ERROR_BUCKET_KEYS
     }
 
-    # Layer 4: Worst-10 and Best-10 forensic roster
+    # Layer 4: Worst-10 and Best-10 forensic roster (music pages only)
     sorted_by_q = sorted(results, key=lambda r: (r.q_score, r.page.page_id))
     worst_pages = [
         {
@@ -613,7 +739,7 @@ def build_report(
         for r in reversed(sorted_by_q[-10:])
     ]
 
-    latencies = sorted(r.page.latency_s for r in results if r.page.latency_s is not None)
+    latencies = sorted(p.latency_s for p in pages if p.latency_s is not None)
     eff = {
         "median_latency_s": round(_percentile(latencies, 50.0), 4) if latencies else None,
         "p95_latency_s": round(_percentile(latencies, 95.0), 4) if latencies else None,
@@ -621,11 +747,16 @@ def build_report(
         "parameter_count": (telemetry or {}).get("parameter_count"),
     }
 
+    adv_scorecard = dict(adversarial) if adversarial else {}
+    if neg_pages and "non_music_fp_count" not in adv_scorecard:
+        adv_scorecard["non_music_fp_count"] = nc_metrics["nc_fp"]
+
     return {
         "schema_version": "1.0.0",
         "benchmark_version": benchmark_version,
         "split": split,
         "system_name": system_name,
+        "nc_gate": nc_gate,
         "layer1_headline": {
             "ns_score": round(ns.ns_score, 4),
             "ns_ci95": (
@@ -659,7 +790,7 @@ def build_report(
                 k: (round(v, 4) if v is not None else None)
                 for k, v in paired_deltas.items()
             },
-            "adversarial_scorecard": dict(adversarial) if adversarial else {},
+            "adversarial_scorecard": adv_scorecard,
         },
         "layer3_error_taxonomy": layer3,
         "layer4_forensic_pack": {

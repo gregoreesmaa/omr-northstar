@@ -1,0 +1,3 @@
+include LICENSE README.md
+recursive-include schemas *.schema.json
+recursive-include pilot_dev_v0_1 *

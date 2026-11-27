@@ -97,7 +97,7 @@ Alongside the 100% permissive Core Track (`Public-Domain`, `CC0-1.0`, `CC-BY-4.0
 - Users download non-commercial handwritten/archival research corpora (e.g., `CC-BY-NC` datasets such as CVC-MUSCIMA / MUSCIMA++) directly from their upstream academic hosts under their original licenses.
 - `OMR-NS` distributes only lightweight BYOD manifest pointers (file checksums, canonical split IDs, and ground-truth alignment metadata)—never redistributing `CC-BY-NC` images or annotations commercially.
 - Commercial and permissive OMR models that never train on `CC-BY-NC` data gain a **guaranteed zero-leakage, high-diversity handwritten evaluation track** without removing permissive handwritten pages from their training pools.
-- Track results are reported separately (`split = "research_nc_eval_only"`) and never mixed into the permissive `test-v1` headline `NS`.
+- Track results are reported separately (`track = "research_nc_eval_only"`) and never mixed into the permissive `test-v1` headline `NS`.
 
 ---
 

@@ -11,6 +11,7 @@ Enforces OMR-NorthStar schema bounds and governance rules:
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from typing import Any, Mapping, Sequence
@@ -82,7 +83,7 @@ def _is_valid_split(split: Any) -> bool:
 
 
 def _is_number(val: Any) -> bool:
-    return isinstance(val, (int, float)) and not isinstance(val, bool)
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val)
 
 
 def _extract_pages(manifest_or_pages: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -116,13 +117,19 @@ def validate_page_records(
             errors.append(f"{prefix}: expected object, got {type(rec).__name__}")
             continue
 
-        is_neg = bool(rec.get("is_negative_control", False))
+        raw_is_neg = rec.get("is_negative_control", False)
+        if "is_negative_control" in rec and not isinstance(raw_is_neg, bool):
+            errors.append(f"{prefix}: is_negative_control must be boolean, got {raw_is_neg!r}")
+            is_neg = False
+        else:
+            is_neg = bool(raw_is_neg)
 
         for req in REQUIRED_PAGE_FIELDS:
             if req not in rec:
                 errors.append(f"{prefix}: missing required field '{req}'")
-        if not is_neg and "staff_space_px" not in rec:
-            errors.append(f"{prefix}: missing required field 'staff_space_px'")
+        if "staff_space_px" not in rec:
+            if not is_neg:
+                errors.append(f"{prefix}: missing required field 'staff_space_px'")
 
         pid = rec.get("page_id")
         if not isinstance(pid, str) or not pid.strip():
@@ -143,36 +150,53 @@ def validate_page_records(
             errors.append(f"{prefix}: page split {sp!r} does not match manifest split {expected_split!r}")
 
         dom = rec.get("domain")
-        if dom not in DOMAINS:
+        if not isinstance(dom, str) or dom not in DOMAINS:
             errors.append(f"{prefix}: invalid domain {dom!r}")
         elif dom == "CDR":
             cdr_pages.append(rec)
 
-        if rec.get("complexity_tier") not in TIERS:
-            errors.append(f"{prefix}: invalid complexity_tier {rec.get('complexity_tier')!r}")
+        ct = rec.get("complexity_tier")
+        if not isinstance(ct, str) or ct not in TIERS:
+            errors.append(f"{prefix}: invalid complexity_tier {ct!r}")
 
-        if rec.get("visual_tier") not in VALID_VISUAL_TIERS:
-            errors.append(f"{prefix}: invalid visual_tier {rec.get('visual_tier')!r}")
+        vt = rec.get("visual_tier")
+        if not isinstance(vt, str) or vt not in VALID_VISUAL_TIERS:
+            errors.append(f"{prefix}: invalid visual_tier {vt!r}")
 
         if "visual_severity" in rec and rec["visual_severity"] is not None:
-            if rec["visual_severity"] not in VALID_VISUAL_SEVERITIES:
-                errors.append(f"{prefix}: invalid visual_severity {rec['visual_severity']!r}")
+            vs = rec["visual_severity"]
+            if not isinstance(vs, str) or vs not in VALID_VISUAL_SEVERITIES:
+                errors.append(f"{prefix}: invalid visual_severity {vs!r}")
 
-        if rec.get("repertoire_stratum") not in VALID_REPERTOIRE_STRATA:
-            errors.append(f"{prefix}: invalid repertoire_stratum {rec.get('repertoire_stratum')!r}")
+        rs = rec.get("repertoire_stratum")
+        if not isinstance(rs, str) or rs not in VALID_REPERTOIRE_STRATA:
+            errors.append(f"{prefix}: invalid repertoire_stratum {rs!r}")
 
         if "paired_protocol" in rec and rec["paired_protocol"] is not None:
-            if rec["paired_protocol"] not in VALID_PAIRED_PROTOCOLS:
-                errors.append(f"{prefix}: invalid paired_protocol {rec['paired_protocol']!r}")
+            pp = rec["paired_protocol"]
+            if not isinstance(pp, str) or pp not in VALID_PAIRED_PROTOCOLS:
+                errors.append(f"{prefix}: invalid paired_protocol {pp!r}")
+
+        if "stress_test_families" in rec and rec["stress_test_families"] is not None:
+            stf = rec["stress_test_families"]
+            if not isinstance(stf, Sequence) or isinstance(stf, (str, bytes)):
+                errors.append(f"{prefix}: stress_test_families must be a list")
+            else:
+                for fam in stf:
+                    if not isinstance(fam, str) or fam not in VALID_STRESS_FAMILIES:
+                        errors.append(f"{prefix}: invalid stress_test_families entry {fam!r}")
 
         if "human_agreement_score" in rec and rec["human_agreement_score"] is not None:
             has_val = rec["human_agreement_score"]
             if not _is_number(has_val) or not (0.0 <= float(has_val) <= 1.0):
                 errors.append(f"{prefix}: human_agreement_score must be in [0, 1], got {has_val!r}")
 
-        if "staff_space_px" in rec and rec["staff_space_px"] is not None:
+        if "staff_space_px" in rec:
             ss = rec["staff_space_px"]
-            if not isinstance(ss, Mapping) or "median" not in ss:
+            if ss is None:
+                if not is_neg:
+                    errors.append(f"{prefix}: staff_space_px cannot be null on non-negative-control music pages")
+            elif not isinstance(ss, Mapping) or "median" not in ss:
                 errors.append(f"{prefix}: staff_space_px must be an object with 'median'")
             else:
                 med = ss["median"]
@@ -188,6 +212,8 @@ def validate_page_records(
                 kv = geom.get(kfield)
                 if not _is_number(kv) or not (-60.0 <= float(kv) <= 60.0):
                     errors.append(f"{prefix}: geometry.{kfield} out of [-60, 60]: {kv!r}")
+        elif "geometry" in rec:
+            errors.append(f"{prefix}: geometry must be an object")
 
         phot = rec.get("photometry")
         if isinstance(phot, Mapping):
@@ -197,6 +223,8 @@ def validate_page_records(
             ev = phot.get("illumination_gradient_ev")
             if not _is_number(ev) or float(ev) < 0.0:
                 errors.append(f"{prefix}: photometry.illumination_gradient_ev must be >= 0: {ev!r}")
+        elif "photometry" in rec:
+            errors.append(f"{prefix}: photometry must be an object")
 
         opt = rec.get("optics_codec")
         if isinstance(opt, Mapping):
@@ -204,17 +232,27 @@ def validate_page_records(
             if not _is_number(bs) or float(bs) < 0.0:
                 errors.append(f"{prefix}: optics_codec.blur_sigma_px must be >= 0: {bs!r}")
             bd = opt.get("bit_depth")
-            if isinstance(bd, bool) or bd not in VALID_BIT_DEPTHS:
+            if not isinstance(bd, int) or isinstance(bd, bool) or bd not in VALID_BIT_DEPTHS:
                 errors.append(f"{prefix}: optics_codec.bit_depth must be one of {sorted(VALID_BIT_DEPTHS)}, got {bd!r}")
+            codec = opt.get("codec")
+            if not isinstance(codec, str) or not codec.strip():
+                errors.append(f"{prefix}: optics_codec.codec must be a non-empty string, got {codec!r}")
+        elif "optics_codec" in rec:
+            errors.append(f"{prefix}: optics_codec must be an object")
 
         prov = rec.get("provenance")
         if isinstance(prov, Mapping):
+            st = prov.get("source_type")
+            if not isinstance(st, str) or not st.strip():
+                errors.append(f"{prefix}: provenance.source_type must be a non-empty string, got {st!r}")
             gtv = prov.get("gt_verification")
-            if gtv not in VALID_GT_VERIFICATION:
+            if not isinstance(gtv, str) or gtv not in VALID_GT_VERIFICATION:
                 errors.append(f"{prefix}: invalid provenance.gt_verification {gtv!r}")
+        elif "provenance" in rec:
+            errors.append(f"{prefix}: provenance must be an object")
 
         raw_track = rec.get("track")
-        if raw_track is not None and raw_track not in VALID_TRACKS:
+        if raw_track is not None and (not isinstance(raw_track, str) or raw_track not in VALID_TRACKS):
             errors.append(f"{prefix}: invalid track {raw_track!r}")
             page_track = expected_track or "core_permissive"
         elif raw_track is not None and expected_track is not None and raw_track != expected_track:
@@ -226,6 +264,10 @@ def validate_page_records(
             page_track = raw_track or expected_track or "core_permissive"
 
         page_eval_only = rec.get("eval_only")
+        if "eval_only" in rec and not isinstance(page_eval_only, bool):
+            errors.append(f"{prefix}: eval_only must be boolean, got {page_eval_only!r}")
+            page_eval_only = None
+
         if page_track == "research_nc_eval_only":
             effective_eval_only = (
                 page_eval_only if page_eval_only is not None else manifest_eval_only
@@ -243,11 +285,11 @@ def validate_page_records(
         if isinstance(lic, Mapping):
             ml = lic.get("music_license")
             il = lic.get("image_license")
-            if ml not in allowed_licenses:
+            if not isinstance(ml, str) or ml not in allowed_licenses:
                 errors.append(
                     f"{prefix}: non-permissive music_license {ml!r} for track '{page_track}'"
                 )
-            if il not in allowed_licenses:
+            if not isinstance(il, str) or il not in allowed_licenses:
                 errors.append(
                     f"{prefix}: non-permissive image_license {il!r} for track '{page_track}'"
                 )
@@ -293,10 +335,14 @@ def validate_manifest(
         for req in ("schema_version", "benchmark_version", "split", "pages"):
             if req not in manifest:
                 errors.append(f"manifest: missing required field '{req}'")
-        if manifest.get("schema_version") not in (None, "1.0.0"):
-            errors.append(f"manifest: unsupported schema_version {manifest.get('schema_version')!r}")
-        sp = manifest.get("split")
-        if sp is not None:
+        if "schema_version" in manifest and manifest["schema_version"] != "1.0.0":
+            errors.append(f"manifest: unsupported schema_version {manifest['schema_version']!r}")
+        if "benchmark_version" in manifest:
+            bv = manifest["benchmark_version"]
+            if not isinstance(bv, str) or not bv.strip():
+                errors.append(f"manifest: benchmark_version must be a non-empty string, got {bv!r}")
+        if "split" in manifest:
+            sp = manifest["split"]
             if not _is_valid_split(sp):
                 errors.append(f"manifest: invalid split {sp!r}")
             else:
@@ -309,7 +355,7 @@ def validate_manifest(
                         )
         raw_track = manifest.get("track")
         if raw_track is not None:
-            if raw_track not in VALID_TRACKS:
+            if not isinstance(raw_track, str) or raw_track not in VALID_TRACKS:
                 errors.append(f"manifest: invalid track {raw_track!r}")
             else:
                 expected_track = raw_track
@@ -391,6 +437,30 @@ def validate_disjoint_splits(
             f"governance: overlapping HWM writer_id(s) across splits: {', '.join(shared_writers)}"
         )
 
+    def _rwp_devices(pages: Sequence[Mapping[str, Any]]) -> set[str]:
+        devices: set[str] = set()
+        for p in pages:
+            if not isinstance(p, Mapping) or p.get("domain") != "RWP":
+                continue
+            prov = p.get("provenance")
+            did = prov.get("capture_device_id") if isinstance(prov, Mapping) else None
+            if not did:
+                did = p.get("capture_device_id")
+            if isinstance(did, str) and did.strip():
+                devices.add(did.strip())
+        return devices
+
+    dev_devices = _rwp_devices(dev_pages)
+    test_devices = _rwp_devices(test_pages)
+    if test_devices:
+        unseen_devices = test_devices - dev_devices
+        unseen_share = len(unseen_devices) / len(test_devices)
+        if unseen_share < 0.5 - 1e-12:
+            errors.append(
+                f"governance: RWP unseen capture_device_id share {unseen_share * 100:.1f}% "
+                f"({len(unseen_devices)}/{len(test_devices)}) is below 50% minimum"
+            )
+
     return errors
 
 
@@ -414,8 +484,13 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
         if req not in report:
             errors.append(f"report: missing required field '{req}'")
 
-    if report.get("schema_version") not in (None, "1.0.0"):
-        errors.append(f"report: invalid schema_version {report.get('schema_version')!r}")
+    if "schema_version" in report and report["schema_version"] != "1.0.0":
+        errors.append(f"report: invalid schema_version {report['schema_version']!r}")
+
+    if "benchmark_version" in report and (
+        not isinstance(report["benchmark_version"], str) or not report["benchmark_version"].strip()
+    ):
+        errors.append("report: benchmark_version must be a non-empty string")
 
     if "split" in report and not _is_valid_split(report["split"]):
         errors.append(f"report: invalid split {report['split']!r}")
@@ -444,9 +519,13 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
                 or len(ci) != 2
                 or not _is_number(ci[0])
                 or not _is_number(ci[1])
+                or not (0.0 <= float(ci[0]) <= 100.0)
+                or not (0.0 <= float(ci[1]) <= 100.0)
                 or float(ci[0]) > float(ci[1])
             ):
-                errors.append(f"layer1_headline.ns_ci95: must be [lo, hi] with lo <= hi, got {ci!r}")
+                errors.append(
+                    f"layer1_headline.ns_ci95: must be [lo, hi] in [0, 100] with lo <= hi, got {ci!r}"
+                )
         cfr_max = l1.get("cfr_max")
         if not _is_number(cfr_max) or not (0.0 <= float(cfr_max) <= 1.0):
             errors.append(f"layer1_headline.cfr_max: must be in [0, 1], got {cfr_max!r}")
@@ -492,6 +571,8 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
             nupr = hu.get("nupr")
             if not _is_number(nupr) or not (0.0 <= float(nupr) <= 1.0):
                 errors.append(f"layer1_headline.human_utility.nupr: must be in [0, 1], got {nupr!r}")
+    elif "layer1_headline" in report:
+        errors.append("report: layer1_headline must be an object")
 
     # Layer 2
     l2 = report.get("layer2_matrix_and_deltas")
@@ -500,15 +581,31 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
             errors.append("layer2_matrix_and_deltas.tier_domain_matrix: must be an object")
         if not isinstance(l2.get("paired_deltas"), Mapping):
             errors.append("layer2_matrix_and_deltas.paired_deltas: must be an object")
+    elif "layer2_matrix_and_deltas" in report:
+        errors.append("report: layer2_matrix_and_deltas must be an object")
 
     # Layer 3
     l3 = report.get("layer3_error_taxonomy")
     if isinstance(l3, Mapping):
+        l3_valid_nums: list[float] = []
+        l3_has_invalid = False
         for k, v in l3.items():
-            if k not in ERROR_BUCKET_KEYS:
-                errors.append(f"layer3_error_taxonomy: unknown bucket '{k}'")
+            if not isinstance(k, str) or k not in ERROR_BUCKET_KEYS:
+                errors.append(f"layer3_error_taxonomy: unknown bucket {k!r}")
+                l3_has_invalid = True
             elif not _is_number(v) or not (0.0 <= float(v) <= 100.0):
                 errors.append(f"layer3_error_taxonomy.{k}: must be in [0, 100], got {v!r}")
+                l3_has_invalid = True
+            else:
+                l3_valid_nums.append(float(v))
+        if not l3_has_invalid and l3_valid_nums:
+            total_pct = sum(l3_valid_nums)
+            if total_pct > 0.0 and abs(total_pct - 100.0) > 1.0:
+                errors.append(
+                    f"layer3_error_taxonomy: bucket percentages must sum to 100% (+/-1.0%) or all 0.0%, got {total_pct:.2f}%"
+                )
+    elif "layer3_error_taxonomy" in report:
+        errors.append("report: layer3_error_taxonomy must be an object")
 
     # Layer 4
     l4 = report.get("layer4_forensic_pack")
@@ -525,9 +622,12 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
                     for req in ("page_id", "domain", "q_score", "wfpp", "catastrophic_failure"):
                         if req not in item:
                             errors.append(f"layer4_forensic_pack.{roster}[{i}]: missing '{req}'")
-                    if item.get("domain") not in DOMAINS:
+                    item_dom = item.get("domain")
+                    if not isinstance(item_dom, str) or item_dom not in DOMAINS:
                         errors.append(
-                            f"layer4_forensic_pack.{roster}[{i}]: invalid domain {item.get('domain')!r}"
+                            f"layer4_forensic_pack.{roster}[{i}]: invalid domain {item_dom!r}"
                         )
+    elif "layer4_forensic_pack" in report:
+        errors.append("report: layer4_forensic_pack must be an object")
 
     return errors

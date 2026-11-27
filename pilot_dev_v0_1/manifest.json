@@ -32,7 +32,7 @@
       "sub_profile": "CDR-clean",
       "repertoire_stratum": "T1.1",
       "paired_anchor_id": "anchor-t0-melody",
-      "paired_protocol": "B",
+      "paired_protocol": "A",
       "staff_space_px": { "median": 12.0, "min": 12.0, "max": 12.0 },
       "geometry": {
         "rotation_deg": 0.0,
@@ -85,7 +85,7 @@
       "sub_profile": "CDR-clean",
       "repertoire_stratum": "T1.2",
       "paired_anchor_id": "anchor-t1-piano",
-      "paired_protocol": "A",
+      "paired_protocol": "B",
       "staff_space_px": { "median": 11.5, "min": 11.5, "max": 11.5 },
       "geometry": {
         "rotation_deg": 0.0,
@@ -138,7 +138,7 @@
       "sub_profile": "CDR-clean",
       "repertoire_stratum": "T1.2",
       "paired_anchor_id": "anchor-t1-piano",
-      "paired_protocol": "A",
+      "paired_protocol": "B",
       "staff_space_px": { "median": 11.0, "min": 11.0, "max": 11.0 },
       "geometry": {
         "rotation_deg": 0.0,
@@ -191,7 +191,7 @@
       "sub_profile": "ALS-plate",
       "repertoire_stratum": "T2.1",
       "paired_anchor_id": "anchor-t2-counterpoint",
-      "paired_protocol": "B",
+      "paired_protocol": "A",
       "staff_space_px": { "median": 10.2, "min": 9.8, "max": 10.6 },
       "geometry": {
         "rotation_deg": 0.6,
@@ -294,6 +294,7 @@
       "domain": "ALS",
       "complexity_tier": "T0",
       "visual_tier": "E",
+      "is_negative_control": true,
       "sub_profile": "ALS-negative-control",
       "repertoire_stratum": "T1.1",
       "paired_anchor_id": null,
@@ -322,7 +323,7 @@
       },
       "notational_tags": ["negative_control_blank_staff"],
       "occlusion_and_noise_tags": [],
-      "stress_test_families": ["2A"],
+      "stress_test_families": ["3B"],
       "provenance": {
         "source_type": "archival_blank_staff_control",
         "engraver_or_publisher": "Baerenreiter (1952)",
@@ -350,7 +351,7 @@
       "sub_profile": "RWP-stand-photo",
       "repertoire_stratum": "T1.1",
       "paired_anchor_id": "anchor-t0-melody",
-      "paired_protocol": "B",
+      "paired_protocol": "A",
       "staff_space_px": { "median": 9.6, "min": 8.8, "max": 10.4 },
       "geometry": {
         "rotation_deg": 3.4,
@@ -403,7 +404,7 @@
       "sub_profile": "RWP-glare-angle",
       "repertoire_stratum": "T2.1",
       "paired_anchor_id": "anchor-t2-counterpoint",
-      "paired_protocol": "B",
+      "paired_protocol": "A",
       "staff_space_px": { "median": 8.9, "min": 7.9, "max": 9.8 },
       "geometry": {
         "rotation_deg": -4.8,
@@ -509,7 +510,7 @@
       "sub_profile": "HWM-a",
       "repertoire_stratum": "T1.2",
       "paired_anchor_id": "anchor-t1-piano",
-      "paired_protocol": "C",
+      "paired_protocol": "D2",
       "staff_space_px": { "median": 10.8, "min": 9.4, "max": 12.1 },
       "geometry": {
         "rotation_deg": -1.4,

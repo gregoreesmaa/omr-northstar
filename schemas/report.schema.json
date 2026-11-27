@@ -162,9 +162,9 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "delta_engraver": { "type": ["number", "null"] },
-            "delta_photo": { "type": ["number", "null"] },
-            "delta_handwriting": { "type": ["number", "null"] }
+            "delta_engraver": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+            "delta_photo": { "type": ["number", "null"], "minimum": -100, "maximum": 100 },
+            "delta_handwriting": { "type": ["number", "null"], "minimum": -100, "maximum": 100 }
           }
         },
         "adversarial_scorecard": {
@@ -226,6 +226,19 @@
           }
         }
       }
+    },
+    "nc_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n_pages", "nc_fp", "nmhr", "nc_pass", "ns_nc"],
+      "properties": {
+        "n_pages": { "type": "integer", "minimum": 0 },
+        "nc_fp": { "type": "integer", "minimum": 0 },
+        "nmhr": { "type": "number", "minimum": 0, "maximum": 1 },
+        "nc_pass": { "type": "boolean" },
+        "ns_nc": { "type": "number", "minimum": 0, "maximum": 100 }
+      },
+      "description": "Optional top-level Negative-Control Gate (NC-Gate) summary."
     },
     "stress_tests": {
       "type": "object",

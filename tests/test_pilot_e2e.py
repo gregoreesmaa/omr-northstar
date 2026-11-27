@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import pathlib
+import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
+from omr_northstar.cer import parse_musicxml as cer_parse_musicxml
+from omr_northstar.cer import score_musicxml_pair
 from omr_northstar.cli import validate_manifest_records
 from omr_northstar.pilot import (
     CANARY_STRING,
+    _compare_identity_xml,
     load_pilot_manifest,
     parse_musicxml_summary,
     resolve_gt_path,
@@ -17,9 +22,11 @@ from omr_northstar.pilot import (
     run_oracle_baseline,
 )
 from omr_northstar.scoring import DOMAINS, TIERS
+from omr_northstar.validate import validate_manifest, validate_report
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PILOT_DIR = REPO_ROOT / "pilot_dev_v0_1"
+MANIFEST_SCHEMA_PATH = REPO_ROOT / "schemas" / "manifest.schema.json"
 PAGE_SCHEMA_PATH = REPO_ROOT / "schemas" / "page_metadata.schema.json"
 PERMISSIVE_LICENSES = {"Public-Domain", "CC0-1.0", "CC-BY-4.0"}
 
@@ -50,16 +57,33 @@ class TestPilotFixturesAndManifest(unittest.TestCase):
 
     def test_manifest_schema_domains_tiers_anchors_canary_and_licenses(self) -> None:
         manifest = load_pilot_manifest(PILOT_DIR)
+        manifest_schema = json.loads(MANIFEST_SCHEMA_PATH.read_text(encoding="utf-8"))
         schema = json.loads(PAGE_SCHEMA_PATH.read_text(encoding="utf-8"))
         allowed_top_keys = set(schema["properties"].keys())
         required_top_keys = set(schema["required"])
 
+        # Top-level manifest keys & validator checks
+        required_manifest_keys = set(manifest_schema["required"])
+        self.assertTrue(
+            required_manifest_keys.issubset(manifest.keys()),
+            f"pilot manifest missing required top-level keys: {required_manifest_keys - set(manifest.keys())}",
+        )
+        self.assertEqual(manifest.get("schema_version"), "1.0.0")
+        self.assertEqual(manifest.get("split"), "dev-v1")
         self.assertEqual(manifest.get("canary"), CANARY_STRING)
+        self.assertIn("ground_truth_files", manifest)
+        self.assertEqual(validate_manifest(manifest), [])
+
         pages = manifest["pages"]
         self.assertEqual(len(pages), 12)
 
         # CLI validator must return zero errors
         self.assertEqual(validate_manifest_records(pages), [])
+
+        # Verify negative control metadata on ns-pilot-006
+        neg_ctrl = next(rec for rec in pages if rec["page_id"] == "ns-pilot-006")
+        self.assertTrue(neg_ctrl.get("is_negative_control"))
+        self.assertIn("3B", neg_ctrl.get("stress_test_families", []))
 
         domains_seen: set[str] = set()
         tiers_seen: set[str] = set()
@@ -121,11 +145,57 @@ class TestPilotFixturesAndManifest(unittest.TestCase):
         self.assertIn("<accidental>flat</accidental>", xml_texts["ns-pilot-011"])
 
 
+    def test_parse_musicxml_summary_edge_cases_and_cer_alignment(self) -> None:
+        manifest = load_pilot_manifest(PILOT_DIR)
+        for rec in manifest["pages"]:
+            gt_path = resolve_gt_path(PILOT_DIR, manifest, rec["page_id"])
+            summary = parse_musicxml_summary(gt_path)
+            cer_score = cer_parse_musicxml(gt_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["n_notes"], cer_score.total_notes)
+            self.assertEqual(summary["m_gt"], cer_score.total_measures)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            bad_xml = tmp / "broken.musicxml"
+            bad_xml.write_text("<score-partwise><part><measure>", encoding="utf-8")
+            bad_summary = parse_musicxml_summary(bad_xml)
+            self.assertFalse(bad_summary["parseable"])
+            self.assertEqual(bad_summary["n_notes"], 0)
+
+            ns_xml = tmp / "namespaced.musicxml"
+            ns_xml.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<score-partwise xmlns="http://www.musicxml.org/ns/musicxml">'
+                '<part id="P1"><measure number="1">'
+                '<attributes><divisions>1</divisions></attributes>'
+                '<note><pitch><step>C</step><octave>4</octave></pitch>'
+                '<duration>bad</duration><voice>vA</voice><type>quarter</type></note>'
+                '</measure></part></score-partwise>',
+                encoding="utf-8",
+            )
+            ns_summary = parse_musicxml_summary(ns_xml)
+            self.assertTrue(ns_summary["parseable"])
+            self.assertEqual(ns_summary["n_notes"], 1)
+            self.assertEqual(ns_summary["events"][0][4], "vA")
+            self.assertEqual(ns_summary["events"][0][2], 0)
+
+
 class TestPilotBaselines(unittest.TestCase):
     """Run oracle and degraded baselines end-to-end and verify exact invariants."""
 
     def test_oracle_baseline_perfect_score(self) -> None:
-        report = run_oracle_baseline(PILOT_DIR)
+        with mock.patch(
+            "omr_northstar.pilot._cer_score_musicxml_pair",
+            wraps=score_musicxml_pair,
+        ) as mock_scorer:
+            report = run_oracle_baseline(PILOT_DIR)
+            self.assertEqual(
+                mock_scorer.call_count,
+                12,
+                "run_oracle_baseline must invoke cer.score_musicxml_pair for all 12 pages without silent fallback.",
+            )
+
+        self.assertEqual(validate_report(report), [])
         l1 = report["layer1_headline"]
         l2 = report["layer2_matrix_and_deltas"]
 
@@ -142,10 +212,30 @@ class TestPilotBaselines(unittest.TestCase):
         self.assertAlmostEqual(l2["paired_deltas"]["delta_photo"], 0.0, places=4)
         self.assertAlmostEqual(l2["paired_deltas"]["delta_handwriting"], 0.0, places=4)
 
+    def test_compare_identity_xml_non_identical_pair(self) -> None:
+        manifest = load_pilot_manifest(PILOT_DIR)
+        gt_a = resolve_gt_path(PILOT_DIR, manifest, "ns-pilot-001")
+        gt_b = resolve_gt_path(PILOT_DIR, manifest, "ns-pilot-002")
+        parseable, s_note, s_struct, s_expr, s_play, wfpp = _compare_identity_xml(
+            gt_a,
+            gt_b,
+            page_id="ns-pilot-001",
+            work_id="pilot-w01",
+            domain="CDR",
+            tier="T0",
+        )
+        self.assertTrue(parseable)
+        self.assertLess(s_note, 1.0)
+        self.assertGreater(wfpp, 0.0)
+        self.assertGreaterEqual(s_struct, 0.0)
+        self.assertGreaterEqual(s_expr, 0.0)
+        self.assertGreaterEqual(s_play, 0.0)
+
     def test_degraded_baseline_anti_gaming_and_paired_deltas(self) -> None:
         report = run_degraded_baseline(PILOT_DIR, seed=42)
         report_repeat = run_degraded_baseline(PILOT_DIR, seed=42)
         self.assertEqual(report, report_repeat, "Degraded baseline must be deterministic for fixed seed.")
+        self.assertEqual(validate_report(report), [])
 
         l1 = report["layer1_headline"]
         l2 = report["layer2_matrix_and_deltas"]

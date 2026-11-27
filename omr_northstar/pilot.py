@@ -22,9 +22,45 @@ from .scoring import PageMetrics, build_report
 CANARY_STRING = "OMR_NS_V1_CANARY_DO_NOT_TRAIN"
 
 try:
-    from .cer import score_musicxml_pair as _cer_score_musicxml_pair  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover - cer.py is optional for standalone pilot smoke runs
+    from .cer import (
+        _measure_transcribe_cost as _cer_measure_transcribe_cost,
+        parse_musicxml as _cer_parse_musicxml,
+        score_musicxml_pair as _cer_score_musicxml_pair,
+    )
+except ImportError:  # pragma: no cover - cer.py is optional for standalone pilot smoke runs
+    _cer_measure_transcribe_cost = None
+    _cer_parse_musicxml = None
     _cer_score_musicxml_pair = None
+
+
+def _local_tag(tag: str) -> str:
+    """Strip XML namespace URI if present."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_child(elem: ET.Element, name: str) -> ET.Element | None:
+    for child in elem:
+        if _local_tag(child.tag) == name:
+            return child
+    return None
+
+
+def _iter_children(elem: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in elem if _local_tag(child.tag) == name]
+
+
+def _child_text(elem: ET.Element, name: str, default: str = "") -> str:
+    child = _find_child(elem, name)
+    if child is None or child.text is None:
+        return default
+    return child.text.strip()
+
+
+def _safe_int(value: str, default: int = 0) -> int:
+    try:
+        return int(value.strip())
+    except (TypeError, ValueError, AttributeError):
+        return default
 
 
 def load_pilot_manifest(pilot_dir: str | pathlib.Path) -> dict[str, Any]:
@@ -50,10 +86,25 @@ def resolve_gt_path(
 def parse_musicxml_summary(xml_path: str | pathlib.Path) -> dict[str, Any]:
     """Parse a MusicXML ``<score-partwise>`` file and extract structural counts."""
     path = pathlib.Path(xml_path)
-    tree = ET.parse(path)
-    root = tree.getroot()
+    try:
+        xml_text = path.read_text(encoding="utf-8")
+        root = ET.fromstring(xml_text)
+    except (ET.ParseError, OSError):
+        return {
+            "parseable": False,
+            "n_parts": 0,
+            "n_staves": 0,
+            "m_gt": 0,
+            "n_notes": 0,
+            "n_rests": 0,
+            "n_dynamics": 0,
+            "n_lyrics": 0,
+            "transcribe_cost": 0.0,
+            "events": [],
+        }
 
-    parts = root.findall("part")
+    parseable = _local_tag(root.tag) == "score-partwise"
+    parts = _iter_children(root, "part")
     n_parts = len(parts)
     n_notes = 0
     n_rests = 0
@@ -61,44 +112,69 @@ def parse_musicxml_summary(xml_path: str | pathlib.Path) -> dict[str, Any]:
     n_lyrics = 0
     n_staves = 0
     m_gt = 0
-    events: list[tuple[str, str, int, str, int, str]] = []
+    fallback_tc = 0.0
+    events: list[tuple[str, str, int, str, str, str]] = []
 
     for part_idx, part in enumerate(parts):
         part_id = part.attrib.get("id", f"P{part_idx + 1}")
-        measures = part.findall("measure")
-        if part_idx == 0:
-            m_gt = len(measures)
+        measures = _iter_children(part, "measure")
         part_staves = 1
         for measure in measures:
             m_num = measure.attrib.get("number", "0")
-            for attr in measure.findall("attributes"):
-                staves_el = attr.find("staves")
-                if staves_el is not None and staves_el.text:
-                    part_staves = max(part_staves, int(staves_el.text.strip()))
-            n_dynamics += len(measure.findall(".//dynamics"))
-            for note in measure.findall("note"):
-                if note.find("rest") is not None:
+            for attr in _iter_children(measure, "attributes"):
+                staves_txt = _child_text(attr, "staves")
+                if staves_txt:
+                    part_staves = max(part_staves, max(1, _safe_int(staves_txt, 1)))
+            m_dyn = sum(1 for el in measure.iter() if _local_tag(el.tag) == "dynamics")
+            n_dynamics += m_dyn
+            m_notes = 0
+            m_rests = 0
+            m_lyrics = 0
+            for note in _iter_children(measure, "note"):
+                staff_txt = _child_text(note, "staff")
+                if staff_txt:
+                    part_staves = max(part_staves, max(1, _safe_int(staff_txt, 1)))
+                if _find_child(note, "rest") is not None:
                     n_rests += 1
+                    m_rests += 1
+                    continue
+                pitch_el = _find_child(note, "pitch")
+                if pitch_el is None:
                     continue
                 n_notes += 1
-                n_lyrics += len(note.findall("lyric"))
-                pitch_el = note.find("pitch")
-                step = pitch_el.findtext("step", default="") if pitch_el is not None else ""
-                alter = pitch_el.findtext("alter", default="0") if pitch_el is not None else "0"
-                octave = pitch_el.findtext("octave", default="0") if pitch_el is not None else "0"
-                dur = int(note.findtext("duration", default="0"))
-                voice = note.findtext("voice", default="1")
-                events.append((part_id, m_num, dur, f"{step}{alter}:{octave}", int(voice), note.findtext("type", default="")))
+                m_notes += 1
+                note_lyrics = len(_iter_children(note, "lyric"))
+                n_lyrics += note_lyrics
+                m_lyrics += note_lyrics
+                step = _child_text(pitch_el, "step", "")
+                alter = _child_text(pitch_el, "alter", "0")
+                octave = _child_text(pitch_el, "octave", "0")
+                dur = _safe_int(_child_text(note, "duration", "0"), 0)
+                voice = _child_text(note, "voice", "1")
+                note_type = _child_text(note, "type", "")
+                events.append((part_id, m_num, dur, f"{step}{alter}:{octave}", voice, note_type))
+            m_expr = m_dyn + m_lyrics
+            if m_notes > 0 or m_rests > 0 or m_expr > 0:
+                fallback_tc += 2.5 * m_notes + 1.0 * m_rests + 0.5 * m_expr
         n_staves += part_staves
+        m_gt += len(measures) * part_staves
 
-    # Rational-musician baseline transcription cost (strictly positive even for blank staves)
-    transcribe_cost = float(max(1.0, 2.0 * n_notes + 1.0 * n_rests + 1.5 * m_gt + 1.0 * (n_dynamics + n_lyrics)))
+    transcribe_cost = float(fallback_tc)
+    if parseable and _cer_parse_musicxml is not None and _cer_measure_transcribe_cost is not None:
+        try:
+            cer_score = _cer_parse_musicxml(xml_text)
+            n_notes = cer_score.total_notes
+            m_gt = cer_score.total_measures
+            n_staves = cer_score.num_staves
+            transcribe_cost = float(sum(_cer_measure_transcribe_cost(m) for m in cer_score.measures))
+        except (ET.ParseError, ValueError):
+            pass
 
     return {
-        "parseable": root.tag.endswith("score-partwise"),
+        "parseable": parseable,
         "n_parts": n_parts,
-        "n_staves": max(1, n_staves),
-        "m_gt": max(1, m_gt),
+        "n_staves": max(1, n_staves) if parseable else n_staves,
+        "m_gt": m_gt,
         "n_notes": n_notes,
         "n_rests": n_rests,
         "n_dynamics": n_dynamics,
@@ -117,22 +193,35 @@ def _extract_engraver(rec: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _compare_identity_xml(gt_path: pathlib.Path, pred_path: pathlib.Path) -> tuple[bool, float, float, float, float, float]:
+def _compare_identity_xml(
+    gt_path: pathlib.Path,
+    pred_path: pathlib.Path,
+    *,
+    page_id: str = "pilot-page",
+    work_id: str = "pilot-work",
+    domain: str = "CDR",
+    tier: str = "T1",
+) -> tuple[bool, float, float, float, float, float]:
     """Compare two MusicXML files; uses ``cer.score_musicxml_pair`` if available, else stdlib exact-event check."""
     if _cer_score_musicxml_pair is not None:
-        try:
-            res = _cer_score_musicxml_pair(gt_path, pred_path)
-            if isinstance(res, Mapping) and {"s_note", "s_struct", "s_expr", "s_play", "wfpp"}.issubset(res.keys()):
-                return (
-                    bool(res.get("parseable", True)),
-                    float(res["s_note"]),
-                    float(res["s_struct"]),
-                    float(res["s_expr"]),
-                    float(res["s_play"]),
-                    float(res["wfpp"]),
-                )
-        except Exception:
-            pass
+        pred_xml = pathlib.Path(pred_path).read_text(encoding="utf-8")
+        gt_xml = pathlib.Path(gt_path).read_text(encoding="utf-8")
+        pm = _cer_score_musicxml_pair(
+            pred_xml,
+            gt_xml,
+            page_id=page_id,
+            work_id=work_id,
+            domain=domain,
+            tier=tier,
+        )
+        return (
+            bool(pm.parseable),
+            float(pm.s_note),
+            float(pm.s_struct),
+            float(pm.s_expr),
+            float(pm.s_play),
+            float(pm.wfpp),
+        )
 
     gt_info = parse_musicxml_summary(gt_path)
     pred_info = parse_musicxml_summary(pred_path)
@@ -156,9 +245,19 @@ def run_oracle_baseline(pilot_dir: str | pathlib.Path) -> dict[str, Any]:
 
     for rec in records:
         page_id = str(rec["page_id"])
+        work_id = str(rec["work_id"])
+        domain = str(rec["domain"])
+        tier = str(rec["complexity_tier"])
         gt_path = resolve_gt_path(pilot_dir, manifest, page_id)
         summary = parse_musicxml_summary(gt_path)
-        parseable, s_note, s_struct, s_expr, s_play, wfpp = _compare_identity_xml(gt_path, gt_path)
+        parseable, s_note, s_struct, s_expr, s_play, wfpp = _compare_identity_xml(
+            gt_path,
+            gt_path,
+            page_id=page_id,
+            work_id=work_id,
+            domain=domain,
+            tier=tier,
+        )
 
         page_metrics.append(
             PageMetrics(
@@ -262,7 +361,7 @@ def run_degraded_baseline(
         t_pen = tier_difficulty_pen.get(tier, 0.02)
         jitter = rng.uniform(-0.012, 0.012)
 
-        # Introduce realistic engraver sensitivity on Protocol A (Verovio slightly lower than Dorico)
+        # Introduce realistic engraver sensitivity on Protocol B (Verovio slightly lower than Dorico)
         engraver = _extract_engraver(rec)
         eng_pen = 0.025 if (domain == "CDR" and engraver and "Verovio" in engraver) else 0.0
 
@@ -279,9 +378,9 @@ def run_degraded_baseline(
         bsvr = max(0.55, min(1.0, s_struct + 0.06))
 
         # Negative-control blank staff: clean-strong system avoids hallucinating notes on ALS
-        if n_gt == 0:
-            s_note, s_struct, s_expr, s_play = 0.96, 0.95, 0.94, 0.96
-            wfpp = 0.08 * t_cost
+        if n_gt == 0 and n_pred == 0:
+            s_note, s_struct, s_expr, s_play = 1.0, 0.95, 0.94, 1.0
+            wfpp = 0.0
             n_pred = 0
 
         # Simulate realistic catastrophic repetition loop on brutal T5 HWM page

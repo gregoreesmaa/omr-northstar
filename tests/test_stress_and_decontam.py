@@ -5,10 +5,13 @@ MusicXML trap generators, and blind symbolic 8-gram scrubbing index.
 from __future__ import annotations
 
 import json
+import math
 import unittest
 import xml.etree.ElementTree as ET
 
+from omr_northstar.cer import parse_musicxml
 from omr_northstar.decontam import (
+    _extract_voice_note_streams,
     build_scrubbing_index,
     check_corpus_overlap,
     compute_symbolic_8gram_hashes,
@@ -119,6 +122,17 @@ class TestStressScorers(unittest.TestCase):
         self.assertEqual(fail.copy_loop_rate, 1.0)
         self.assertEqual(len(fail.gate_failures), 3)
 
+        # Missing key in pred mapping must not falsely match None GT value
+        res_missing = score_ostinato_trap(
+            {(2, 0): "F#4"},
+            {(1, 0): None, (2, 0): "F#4"},
+            16,
+            16,
+            False,
+        )
+        self.assertFalse(res_missing.passed)
+        self.assertAlmostEqual(res_missing.tsr, 0.5)
+
     def test_counterfactual_trap_pass_and_fail(self) -> None:
         orig = ["C4"] * 50
         mut = ["C#4"] * 50
@@ -148,6 +162,16 @@ class TestStressScorers(unittest.TestCase):
         with self.assertRaises(ValueError):
             score_counterfactual_trap(["C#4"], ["C4", "D4"], ["C#4", "D#4"])
 
+        # None predictions must never inflate mutation_site_f1 above 1.0
+        res_none = score_counterfactual_trap(
+            [None, "C#4"],
+            ["C4", "C4"],
+            [None, "C#4"],
+        )
+        self.assertEqual(res_none.matched_count, 1)
+        self.assertLessEqual(res_none.mutation_site_f1, 1.0)
+        self.assertAlmostEqual(res_none.mutation_site_f1, 2.0 / 3.0)
+
     def test_positional_decay_pass_and_fail(self) -> None:
         ok = score_positional_decay(0.96, 0.92, pred_systems=12, gt_systems=12)
         self.assertTrue(ok.passed)
@@ -168,6 +192,19 @@ class TestStressScorers(unittest.TestCase):
         fail_extra = score_positional_decay(0.96, 0.95, pred_systems=13, gt_systems=12)
         self.assertFalse(fail_extra.passed)
         self.assertLess(fail_extra.system_completeness, 1.0)
+
+        # Invalid F1 values (NaN, Inf, < 0, > 1) must raise ValueError
+        for bad_q1, bad_q4 in (
+            (math.nan, 0.9),
+            (0.9, math.nan),
+            (math.inf, 0.9),
+            (0.9, -math.inf),
+            (-0.1, 0.9),
+            (0.9, 1.05),
+            (1.2, 0.9),
+        ):
+            with self.assertRaises(ValueError):
+                score_positional_decay(bad_q1, bad_q4, pred_systems=4, gt_systems=4)
 
     def test_negative_control_pass_and_fail(self) -> None:
         ok = score_negative_control(0, "blank_staff_paper")
@@ -309,6 +346,189 @@ class TestParametricTrapGenerators(unittest.TestCase):
         self.assertAlmostEqual(good_res.phr, 0.0)
         self.assertAlmostEqual(good_res.mutation_site_f1, 1.0)
 
+        # Round-trip both ostinato & counterfactual XML through cer.parse_musicxml
+        cer_base = parse_musicxml(base_xml)
+        cer_mut = parse_musicxml(mut_xml1)
+        self.assertEqual(len(cer_base.measures), 16)
+        self.assertEqual(len(cer_mut.measures), 16)
+        self.assertEqual(
+            sum(len(m.notes) for m in cer_base.measures),
+            sum(len(m.notes) for m in cer_mut.measures),
+        )
+
+    def test_ostinato_accidental_state_and_cer_roundtrip(self) -> None:
+        alter_to_acc = {-2: "flat-flat", -1: "flat", 0: "natural", 1: "sharp", 2: "double-sharp"}
+        saw_cancellation = False
+
+        for seed in range(30):
+            xml_str, meta = generate_ostinato_trap_musicxml(n_bars=8, seed=seed)
+            root = ET.fromstring(xml_str)
+            for measure in root.findall("./part/measure"):
+                active_alter: dict[tuple[str, int], int] = {}
+                for note in measure.findall("note"):
+                    pitch = note.find("pitch")
+                    assert pitch is not None
+                    step = pitch.findtext("step", "").strip()
+                    alter = int(pitch.findtext("alter", "0").strip())
+                    octave = int(pitch.findtext("octave", "4").strip())
+                    prev = active_alter.get((step, octave), 0)
+                    acc_el = note.find("accidental")
+                    if alter != prev:
+                        self.assertIsNotNone(
+                            acc_el,
+                            f"seed={seed} measure={measure.attrib['number']} missing accidental for {step}{alter}/{octave}",
+                        )
+                        assert acc_el is not None
+                        self.assertEqual(acc_el.text, alter_to_acc[alter])
+                        if prev != 0 and alter == 0:
+                            saw_cancellation = True
+                    else:
+                        self.assertIsNone(
+                            acc_el,
+                            f"seed={seed} measure={measure.attrib['number']} redundant accidental for {step}{alter}/{octave}",
+                        )
+                    active_alter[(step, octave)] = alter
+
+            # Round-trip through CER parser
+            cer_score = parse_musicxml(xml_str)
+            self.assertEqual(len(cer_score.measures), 8)
+            self.assertEqual(meta["n_bars"], 8)
+
+        self.assertTrue(
+            saw_cancellation,
+            "Expected at least one natural cancellation after an earlier accidental flip in the same bar.",
+        )
+
+    def test_counterfactual_xsd_order_float_alter_and_namespace(self) -> None:
+        # 1. XSD order check + CER round-trip: <accidental> must appear after
+        # <type>/<dot> and before <stem>/<staff>/<beam>/<notations>/<lyric>.
+        xml_with_post_tags = """<?xml version='1.0' encoding='utf-8'?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Test</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>4</divisions></attributes>
+      <note>
+        <pitch><step>C</step><alter>1</alter><octave>4</octave></pitch>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+        <dot/>
+        <stem>up</stem>
+        <staff>1</staff>
+        <beam number="1">begin</beam>
+        <notations><articulations><staccato/></articulations></notations>
+        <lyric number="1"><text>la</text></lyric>
+      </note>
+      <note>
+        <pitch><step>D</step><octave>4</octave></pitch>
+        <duration>2</duration>
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+      </note>
+      <note>
+        <pitch><step>E</step><octave>4</octave></pitch>
+        <duration>4</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"""
+
+        post_tags = {
+            "time-modification",
+            "stem",
+            "notehead",
+            "notehead-text",
+            "staff",
+            "beam",
+            "notations",
+            "lyric",
+            "play",
+            "listen",
+        }
+        saw_accidental_mutation = False
+        for seed in range(20):
+            mut_xml, sites = generate_counterfactual_musicxml(
+                xml_with_post_tags, mutation_rate=1.0, seed=seed
+            )
+            self.assertEqual(len(sites), 3)
+            root = ET.fromstring(mut_xml)
+            for note in root.findall(".//note"):
+                tags = [child.tag for child in note]
+                if "accidental" in tags:
+                    saw_accidental_mutation = True
+                    acc_idx = tags.index("accidental")
+                    for pre in ("type", "dot"):
+                        if pre in tags:
+                            self.assertGreater(acc_idx, tags.index(pre))
+                    for post in post_tags:
+                        if post in tags:
+                            self.assertLess(acc_idx, tags.index(post))
+            # Must round-trip cleanly through CER
+            cer_score = parse_musicxml(mut_xml)
+            self.assertEqual(len(cer_score.measures[0].notes), 3)
+        self.assertTrue(saw_accidental_mutation)
+
+        # 2. Float <alter> (1.0, 0.5) and whitespace-only <alter>
+        xml_float_alter = """<?xml version='1.0' encoding='utf-8'?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>FloatAlter</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>4</divisions></attributes>
+      <note>
+        <pitch><step>C</step><alter>1.0</alter><octave>4</octave></pitch>
+        <duration>4</duration><voice>1</voice><type>quarter</type><stem>up</stem>
+      </note>
+      <note>
+        <pitch><step>D</step><alter>0.5</alter><octave>4</octave></pitch>
+        <duration>4</duration><voice>1</voice><type>quarter</type><stem>up</stem>
+      </note>
+      <note>
+        <pitch><step>E</step><alter>   </alter><octave>4</octave></pitch>
+        <duration>4</duration><voice>1</voice><type>quarter</type><staff>1</staff>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"""
+        mut_float_xml, float_sites = generate_counterfactual_musicxml(
+            xml_float_alter, mutation_rate=1.0, seed=7
+        )
+        self.assertEqual(len(float_sites), 3)
+        self.assertEqual(float_sites[0]["original"], "C#4")
+        self.assertEqual(float_sites[1]["original"], "D4")
+        self.assertEqual(float_sites[2]["original"], "E4")
+        ET.fromstring(mut_float_xml)
+
+        # 3. Namespace-agnostic traversal
+        ns = "http://www.musicxml.org/ns/musicxml"
+        ns_xml = f"""<?xml version='1.0' encoding='utf-8'?>
+<score-partwise xmlns="{ns}" version="4.0">
+  <part-list><score-part id="P1"><part-name>NS</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>4</divisions></attributes>
+      <note>
+        <pitch><step>G</step><octave>4</octave></pitch>
+        <duration>4</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"""
+        mut_ns_xml, ns_sites = generate_counterfactual_musicxml(
+            ns_xml, mutation_rate=1.0, seed=5
+        )
+        self.assertEqual(len(ns_sites), 1)
+        cer_ns = parse_musicxml(mut_ns_xml)
+        self.assertEqual(len(cer_ns.measures[0].notes), 1)
+
 
 class TestBlindScrubbingIndex(unittest.TestCase):
     """Test transposition/tempo-invariant 8-gram hashing & zero-leakage overlap checks."""
@@ -399,6 +619,188 @@ class TestBlindScrubbingIndex(unittest.TestCase):
             compute_symbolic_8gram_hashes(xml_test, n=2)
         with self.assertRaises(ValueError):
             check_corpus_overlap({"c1": xml_test}, index, min_shared_8grams=0)
+
+    def test_multivoice_backup_no_cross_measure_drift(self) -> None:
+        # Measure 1 has voice 1 (4 quarters = 4 beats), <backup> of 4 beats,
+        # and a shorter voice 2 (only 2 quarters). Measure 2 continues voice 1.
+        # Measure 2 must start at beat 4 (not beat 2), so voice 1's 8-gram
+        # matches a single-voice reference score with the same 8 notes.
+        v1_notes = [
+            ("C", 0, 4, 4),
+            ("D", 0, 4, 4),
+            ("E", 0, 4, 4),
+            ("G", 0, 4, 4),
+            ("A", 0, 4, 4),
+            ("G", 0, 4, 4),
+            ("F", 0, 4, 4),
+            ("E", 0, 4, 4),
+        ]
+        ref_xml = _make_melody_musicxml(v1_notes, divisions=4)
+
+        score = ET.Element("score-partwise", {"version": "4.0"})
+        part_list = ET.SubElement(score, "part-list")
+        sp = ET.SubElement(part_list, "score-part", {"id": "P1"})
+        ET.SubElement(sp, "part-name").text = "MultiVoice"
+        part = ET.SubElement(score, "part", {"id": "P1"})
+
+        m1 = ET.SubElement(part, "measure", {"number": "1"})
+        attrs = ET.SubElement(m1, "attributes")
+        ET.SubElement(attrs, "divisions").text = "4"
+        for step, alter, octv, dur in v1_notes[:4]:
+            n_el = ET.SubElement(m1, "note")
+            p_el = ET.SubElement(n_el, "pitch")
+            ET.SubElement(p_el, "step").text = step
+            ET.SubElement(p_el, "octave").text = str(octv)
+            ET.SubElement(n_el, "duration").text = str(dur)
+            ET.SubElement(n_el, "voice").text = "1"
+        # Overshooting backup (duration=24 > measure length 16) clamps to measure_start
+        bkp = ET.SubElement(m1, "backup")
+        ET.SubElement(bkp, "duration").text = "24"
+        # Shorter voice 2 (only 2 quarter notes = 8 ticks)
+        for step in ("C", "G"):
+            n_el = ET.SubElement(m1, "note")
+            p_el = ET.SubElement(n_el, "pitch")
+            ET.SubElement(p_el, "step").text = step
+            ET.SubElement(p_el, "octave").text = "3"
+            ET.SubElement(n_el, "duration").text = "4"
+            ET.SubElement(n_el, "voice").text = "2"
+
+        m2 = ET.SubElement(part, "measure", {"number": "2"})
+        for step, alter, octv, dur in v1_notes[4:]:
+            n_el = ET.SubElement(m2, "note")
+            p_el = ET.SubElement(n_el, "pitch")
+            ET.SubElement(p_el, "step").text = step
+            ET.SubElement(p_el, "octave").text = str(octv)
+            ET.SubElement(n_el, "duration").text = str(dur)
+            ET.SubElement(n_el, "voice").text = "1"
+
+        mv_xml = ET.tostring(score, encoding="unicode", xml_declaration=True)
+        self.assertEqual(
+            compute_symbolic_8gram_hashes(mv_xml, n=8),
+            compute_symbolic_8gram_hashes(ref_xml, n=8),
+        )
+
+    def test_chordal_skyline_collapse_eliminates_zero_iois(self) -> None:
+        # 8 chords where the skyline (top note) matches self.melody_a[:8]
+        skyline = self.melody_a[:8]
+        skyline_xml = _make_melody_musicxml(skyline, divisions=4)
+
+        score = ET.Element("score-partwise", {"version": "4.0"})
+        part_list = ET.SubElement(score, "part-list")
+        sp = ET.SubElement(part_list, "score-part", {"id": "P1"})
+        ET.SubElement(sp, "part-name").text = "Chords"
+        part = ET.SubElement(score, "part", {"id": "P1"})
+        m1 = ET.SubElement(part, "measure", {"number": "1"})
+        attrs = ET.SubElement(m1, "attributes")
+        ET.SubElement(attrs, "divisions").text = "4"
+
+        for step, alter, octv, dur in skyline:
+            # Lower chord tone first
+            low = ET.SubElement(m1, "note")
+            p_low = ET.SubElement(low, "pitch")
+            ET.SubElement(p_low, "step").text = step
+            if alter != 0:
+                ET.SubElement(p_low, "alter").text = str(alter)
+            ET.SubElement(p_low, "octave").text = str(octv - 1)
+            ET.SubElement(low, "duration").text = str(dur)
+            ET.SubElement(low, "voice").text = "1"
+
+            # Higher skyline tone as <chord/>
+            high = ET.SubElement(m1, "note")
+            ET.SubElement(high, "chord")
+            p_high = ET.SubElement(high, "pitch")
+            ET.SubElement(p_high, "step").text = step
+            if alter != 0:
+                ET.SubElement(p_high, "alter").text = str(alter)
+            ET.SubElement(p_high, "octave").text = str(octv)
+            ET.SubElement(high, "duration").text = str(dur)
+            ET.SubElement(high, "voice").text = "1"
+
+        chord_xml = ET.tostring(score, encoding="unicode", xml_declaration=True)
+        streams = _extract_voice_note_streams(chord_xml)
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(len(streams[0]), 8)
+        for i in range(len(streams[0]) - 1):
+            self.assertGreater(streams[0][i + 1][0], streams[0][i][0])
+
+        self.assertEqual(
+            compute_symbolic_8gram_hashes(chord_xml, n=8),
+            compute_symbolic_8gram_hashes(skyline_xml, n=8),
+        )
+
+    def test_grand_staff_separates_shared_voice_across_staves(self) -> None:
+        # Both staff 1 (RH) and staff 2 (LH) use <voice>1</voice>
+        rh = self.melody_a[:8]
+        lh = self.melody_b[:8]
+        score = ET.Element("score-partwise", {"version": "4.0"})
+        part_list = ET.SubElement(score, "part-list")
+        sp = ET.SubElement(part_list, "score-part", {"id": "P1"})
+        ET.SubElement(sp, "part-name").text = "Piano"
+        part = ET.SubElement(score, "part", {"id": "P1"})
+        m1 = ET.SubElement(part, "measure", {"number": "1"})
+        attrs = ET.SubElement(m1, "attributes")
+        ET.SubElement(attrs, "divisions").text = "4"
+
+        rh_total = 0
+        for step, alter, octv, dur in rh:
+            n_el = ET.SubElement(m1, "note")
+            p_el = ET.SubElement(n_el, "pitch")
+            ET.SubElement(p_el, "step").text = step
+            if alter != 0:
+                ET.SubElement(p_el, "alter").text = str(alter)
+            ET.SubElement(p_el, "octave").text = str(octv)
+            ET.SubElement(n_el, "duration").text = str(dur)
+            ET.SubElement(n_el, "voice").text = "1"
+            ET.SubElement(n_el, "staff").text = "1"
+            rh_total += dur
+
+        bkp = ET.SubElement(m1, "backup")
+        ET.SubElement(bkp, "duration").text = str(rh_total)
+
+        for step, alter, octv, dur in lh:
+            n_el = ET.SubElement(m1, "note")
+            p_el = ET.SubElement(n_el, "pitch")
+            ET.SubElement(p_el, "step").text = step
+            if alter != 0:
+                ET.SubElement(p_el, "alter").text = str(alter)
+            ET.SubElement(p_el, "octave").text = str(octv)
+            ET.SubElement(n_el, "duration").text = str(dur)
+            ET.SubElement(n_el, "voice").text = "1"
+            ET.SubElement(n_el, "staff").text = "2"
+
+        piano_xml = ET.tostring(score, encoding="unicode", xml_declaration=True)
+        streams = _extract_voice_note_streams(piano_xml)
+        self.assertEqual(len(streams), 2)
+
+        expected_hashes = (
+            compute_symbolic_8gram_hashes(_make_melody_musicxml(rh, divisions=4), n=8)
+            + compute_symbolic_8gram_hashes(_make_melody_musicxml(lh, divisions=4), n=8)
+        )
+        self.assertEqual(compute_symbolic_8gram_hashes(piano_xml, n=8), expected_hashes)
+
+    def test_safe_numeric_parsing_decimal_and_whitespace(self) -> None:
+        xml_decimal = """<?xml version='1.0' encoding='utf-8'?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Dec</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>4.0</divisions></attributes>
+      <note><pitch><step>C</step><alter>   </alter><octave>4</octave></pitch><duration>4.0</duration><voice>1</voice></note>
+      <note><pitch><step>E</step><alter>0.0</alter><octave>4</octave></pitch><duration>2.0</duration><voice>1</voice></note>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>2</duration><voice>1</voice></note>
+      <note><pitch><step>F</step><alter>1.0</alter><octave>4</octave></pitch><duration>4</duration><voice>1</voice></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>6</duration><voice>1</voice></note>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>2</duration><voice>1</voice></note>
+      <note><pitch><step>E</step><alter>-1.0</alter><octave>4</octave></pitch><duration>4</duration><voice>1</voice></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>2</duration><voice>1</voice></note>
+    </measure>
+  </part>
+</score-partwise>"""
+        ref_xml = _make_melody_musicxml(self.melody_a[:8], divisions=4)
+        self.assertEqual(
+            compute_symbolic_8gram_hashes(xml_decimal, n=8),
+            compute_symbolic_8gram_hashes(ref_xml, n=8),
+        )
 
 
 if __name__ == "__main__":

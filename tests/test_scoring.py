@@ -10,11 +10,14 @@ import unittest
 from omr_northstar.cli import format_scorecard, main as cli_main, validate_manifest_records
 from omr_northstar.scoring import (
     DOMAINS,
+    ERROR_BUCKET_KEYS,
     TIER_WEIGHTS,
+    TIERS,
     PageMetrics,
     build_report,
     compute_catastrophic_penalties,
     compute_effective_measure_cost,
+    compute_negative_control_metrics,
     compute_northstar_score,
     compute_ns_bootstrap_ci,
     compute_ntsr,
@@ -310,11 +313,40 @@ class TestBootstrapAndTierWeightedNS(unittest.TestCase):
         p_t2 = PageMetrics("p2", "w2", "RWP", "T2", 0.6, 0.6, 0.6, 0.6, 40.0, 100.0)
         res = [compute_page_quality(p_t0), compute_page_quality(p_t2)]
         tw_ns = compute_tier_weighted_ns(res)
-        expected = (0.05 / 0.30) * 100.0 + (0.25 / 0.30) * 60.0
+        w0 = 0.05 / 0.30
+        w2 = 0.25 / 0.30
+        m_geom = (100.0 ** w0) * (60.0 ** w2)
+        expected = 0.75 * m_geom + 0.25 * 60.0
         self.assertAlmostEqual(tw_ns, expected, places=4)
+
+        # Strict mode penalizes the 4 missing tiers to Q=0.0, CFR=1.0
+        tw_ns_strict = compute_tier_weighted_ns(res, strict_missing_tiers=True)
+        m_geom_strict = (100.0 ** 0.05) * (60.0 ** 0.25) * (0.1 ** 0.70)
+        expected_strict = (0.75 * m_geom_strict + 0.25 * 0.0) * 0.50
+        self.assertAlmostEqual(tw_ns_strict, expected_strict, places=4)
+        self.assertLess(tw_ns_strict, tw_ns)
 
         report = build_report([p_t0, p_t2], system_name="tier-test")
         self.assertAlmostEqual(report["layer1_headline"]["tier_weighted_ns"], expected, places=4)
+
+        # Full 6-tier pack: strict and non-strict produce exact identical Spec 4.3 value
+        tier_qs = {"T0": 0.96, "T1": 0.90, "T2": 0.84, "T3": 0.78, "T4": 0.72, "T5": 0.64}
+        full_pages = [
+            PageMetrics(
+                f"pf_{t}", f"wf_{t}", "CDR", t,
+                q, q, q, q, (1.0 - q) * 100.0, 100.0,
+            )
+            for t, q in tier_qs.items()
+        ]
+        full_res = [compute_page_quality(p) for p in full_pages]
+        tw_full_default = compute_tier_weighted_ns(full_res, strict_missing_tiers=False)
+        tw_full_strict = compute_tier_weighted_ns(full_res, strict_missing_tiers=True)
+        self.assertAlmostEqual(tw_full_default, tw_full_strict, places=9)
+        m_full = 1.0
+        for t in TIERS:
+            m_full *= (tier_qs[t] * 100.0) ** TIER_WEIGHTS[t]
+        expected_full = 0.75 * m_full + 0.25 * 64.0
+        self.assertAlmostEqual(tw_full_strict, expected_full, places=4)
 
     def test_negative_control_non_music_page_safe(self) -> None:
         # Clean negative-control page (n_gt=0, n_pred=0, m_gt=0, m_pred=0, transcribe_cost=0)
@@ -375,6 +407,231 @@ class TestBootstrapAndTierWeightedNS(unittest.TestCase):
         deltas = compute_paired_deltas([compute_page_quality(p) for p in pages])
         # Dorico mean = 92.0, LilyPond = 82.0 -> spread = 10.0 (not max-min=12.0)
         self.assertAlmostEqual(deltas["delta_engraver"], 10.0, places=4)
+
+
+class TestHardeningAndSpecCompliance(unittest.TestCase):
+    """Verify NaN/Inf guards, NC-Gate separation, Layer 3 taxonomy, macro-averaging, and CF refinements."""
+
+    def test_nan_and_inf_inputs_rejected(self) -> None:
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                PageMetrics("p1", "w1", "CDR", "T1", bad, 0.9, 0.9, 0.9, 5.0, 100.0)
+            with self.assertRaises(ValueError):
+                PageMetrics("p1", "w1", "CDR", "T1", 0.9, 0.9, 0.9, 0.9, bad, 100.0)
+            with self.assertRaises(ValueError):
+                PageMetrics("p1", "w1", "CDR", "T1", 0.9, 0.9, 0.9, 0.9, 5.0, 100.0, bsvr=bad)
+            with self.assertRaises(ValueError):
+                compute_effective_measure_cost(bad, 10.0)
+            with self.assertRaises(ValueError):
+                compute_ntsr(bad, 100.0)
+            with self.assertRaises(ValueError):
+                compute_nupr([0.5, bad])
+            with self.assertRaises(ValueError):
+                compute_northstar_score(
+                    {"CDR": bad, "ALS": 80.0, "RWP": 80.0, "HWM": 80.0},
+                    {"CDR": 0.0, "ALS": 0.0, "RWP": 0.0, "HWM": 0.0},
+                )
+            with self.assertRaises(ValueError):
+                compute_northstar_score(
+                    {"CDR": 80.0, "ALS": 80.0, "RWP": 80.0, "HWM": 80.0},
+                    {"CDR": bad, "ALS": 0.0, "RWP": 0.0, "HWM": 0.0},
+                )
+
+    def test_unit_interval_bounds_and_ns_clamping(self) -> None:
+        for field_name in ("s_note", "s_struct", "s_expr", "s_play", "bsvr"):
+            kwargs: dict[str, object] = dict(
+                page_id="p1", work_id="w1", domain="CDR", tier="T1",
+                s_note=0.9, s_struct=0.9, s_expr=0.9, s_play=0.9,
+                wfpp=5.0, transcribe_cost=100.0, bsvr=1.0,
+            )
+            kwargs[field_name] = 1.25
+            with self.assertRaises(ValueError):
+                compute_page_quality(PageMetrics(**kwargs))  # type: ignore[arg-type]
+            kwargs[field_name] = -0.1
+            with self.assertRaises(ValueError):
+                compute_page_quality(PageMetrics(**kwargs))  # type: ignore[arg-type]
+
+        # Out-of-range stratum scores are clamped to [0.0, 100.0] before worst_q & m_geom
+        res = compute_northstar_score(
+            {"CDR": 150.0, "ALS": 90.0, "RWP": 80.0, "HWM": -25.0},
+            {"CDR": 0.0, "ALS": 0.0, "RWP": 0.0, "HWM": 0.0},
+        )
+        self.assertEqual(res.worst_stratum_q, 0.0)
+        self.assertLessEqual(res.ns_score, 100.0)
+        self.assertGreaterEqual(res.ns_score, 0.0)
+
+    def test_negative_control_separation_and_nc_gate(self) -> None:
+        music_pages = [
+            PageMetrics(
+                f"m_{d}", f"w_{d}", d, "T2",
+                0.80, 0.80, 0.80, 0.80, 20.0, 100.0,
+                n_gt=50, n_pred=50, m_gt=8, m_pred=8,
+            )
+            for d in DOMAINS
+        ]
+        neg_clean = PageMetrics(
+            "nc_ok", "w_nc1", "ALS", "T0",
+            1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+            n_gt=0, n_pred=0, m_gt=0, m_pred=0,
+        )
+        # Rest-only hallucination: n_pred=0 but m_pred=2 -> still fails NC-Gate
+        neg_rest_fp = PageMetrics(
+            "nc_rest", "w_nc2", "ALS", "T0",
+            0.0, 0.0, 0.0, 0.0, 5.0, 0.0,
+            n_gt=0, n_pred=0, m_gt=0, m_pred=2,
+        )
+        neg_note_fp = PageMetrics(
+            "nc_note", "w_nc3", "RWP", "T0",
+            0.0, 0.0, 0.0, 0.0, 10.0, 0.0,
+            n_gt=0, n_pred=4, m_gt=0, m_pred=1,
+        )
+
+        # Standalone metric function
+        nc = compute_negative_control_metrics([neg_clean, neg_rest_fp, neg_note_fp])
+        self.assertEqual(nc["n_pages"], 3)
+        self.assertEqual(nc["nc_fp"], 4)
+        self.assertAlmostEqual(nc["nmhr"], 2.0 / 3.0, places=6)
+        self.assertFalse(nc["nc_pass"])
+
+        # Adding negative-control pages must NOT perturb NS, stratum_scores, axes_macro, or human_utility
+        rep_music_only = build_report(music_pages, system_name="sys", n_boot=200, bootstrap_seed=7)
+        rep_mixed = build_report(
+            music_pages + [neg_clean, neg_rest_fp, neg_note_fp],
+            system_name="sys",
+            n_boot=200,
+            bootstrap_seed=7,
+        )
+        self.assertEqual(rep_music_only["layer1_headline"], rep_mixed["layer1_headline"])
+        self.assertEqual(rep_mixed["nc_gate"]["n_pages"], 3)
+        self.assertEqual(rep_mixed["nc_gate"]["nc_fp"], 4)
+        self.assertFalse(rep_mixed["nc_gate"]["nc_pass"])
+        expected_ns_nc = round(rep_mixed["layer1_headline"]["ns_score"] * (1.0 - 0.25 * (2.0 / 3.0)), 4)
+        self.assertAlmostEqual(rep_mixed["nc_gate"]["ns_nc"], expected_ns_nc, places=3)
+        self.assertEqual(rep_mixed["layer2_matrix_and_deltas"]["adversarial_scorecard"]["non_music_fp_count"], 4)
+
+        # Negative-control-only pack should not crash
+        rep_neg_only = build_report([neg_clean], system_name="neg-only")
+        self.assertTrue(rep_neg_only["nc_gate"]["nc_pass"])
+        self.assertEqual(rep_neg_only["nc_gate"]["n_pages"], 1)
+        self.assertIsNone(rep_neg_only["layer1_headline"]["ns_ci95"])
+
+    def test_layer3_error_taxonomy_skips_zero_error_pages_and_sums_to_100(self) -> None:
+        zero_buckets = {k: 0.0 for k in ERROR_BUCKET_KEYS}
+        err_buckets_1 = {
+            "layout_segmentation_pct": 10.0,
+            "global_context_drift_pct": 10.0,
+            "pitch_accidental_pct": 40.0,
+            "rhythm_meter_pct": 20.0,
+            "polyphony_routing_pct": 10.0,
+            "engraving_expressive_pct": 10.0,
+            "hallucination_truncation_pct": 0.0,
+            "annotation_contamination_pct": 0.0,
+        }
+        err_buckets_2 = {
+            "layout_segmentation_pct": 0.0,
+            "global_context_drift_pct": 20.0,
+            "pitch_accidental_pct": 20.0,
+            "rhythm_meter_pct": 40.0,
+            "polyphony_routing_pct": 0.0,
+            "engraving_expressive_pct": 20.0,
+            "hallucination_truncation_pct": 0.0,
+            "annotation_contamination_pct": 0.0,
+        }
+        pages = [
+            PageMetrics("p1", "w1", "CDR", "T1", 1.0, 1.0, 1.0, 1.0, 0.0, 100.0, error_buckets=zero_buckets),
+            PageMetrics("p2", "w2", "ALS", "T1", 0.8, 0.8, 0.8, 0.8, 20.0, 100.0, error_buckets=err_buckets_1),
+            PageMetrics("p3", "w3", "RWP", "T1", 0.8, 0.8, 0.8, 0.8, 20.0, 100.0, error_buckets=err_buckets_2),
+            PageMetrics("p4", "w4", "HWM", "T1", 1.0, 1.0, 1.0, 1.0, 0.0, 100.0, error_buckets=zero_buckets),
+        ]
+        rep = build_report(pages, system_name="tax-test")
+        l3 = rep["layer3_error_taxonomy"]
+        self.assertAlmostEqual(sum(l3.values()), 100.0, places=4)
+        self.assertAlmostEqual(l3["pitch_accidental_pct"], 30.0, places=4)
+        self.assertAlmostEqual(l3["rhythm_meter_pct"], 30.0, places=4)
+
+        # All zero-error pages -> all 0.0%
+        rep_zero = build_report(
+            [PageMetrics("z1", "wz1", "CDR", "T1", 1.0, 1.0, 1.0, 1.0, 0.0, 100.0, error_buckets=zero_buckets)],
+            system_name="zero-err",
+        )
+        self.assertEqual(sum(rep_zero["layer3_error_taxonomy"].values()), 0.0)
+
+    def test_multi_page_per_work_macro_averaging_and_cluster_bootstrap(self) -> None:
+        # Work A has 3 pages with Q=100; Work B has 1 page with Q=60 -> work macro-avg = 80 (not page avg 90)
+        pages = [
+            PageMetrics(f"cdr_a_{i}", "work_a", "CDR", "T2", 1.0, 1.0, 1.0, 1.0, 0.0, 100.0)
+            for i in range(3)
+        ] + [
+            PageMetrics("cdr_b_0", "work_b", "CDR", "T2", 0.6, 0.6, 0.6, 0.6, 40.0, 100.0),
+            PageMetrics("als_0", "w_als", "ALS", "T2", 0.8, 0.8, 0.8, 0.8, 20.0, 100.0),
+            PageMetrics("rwp_0", "w_rwp", "RWP", "T2", 0.8, 0.8, 0.8, 0.8, 20.0, 100.0),
+            PageMetrics("hwm_0", "w_hwm", "HWM", "T2", 0.8, 0.8, 0.8, 0.8, 20.0, 100.0),
+        ]
+        results = [compute_page_quality(p) for p in pages]
+        s_scores, _ = compute_stratum_scores(results)
+        self.assertAlmostEqual(s_scores["CDR"], 80.0, places=4)
+
+        ci = compute_ns_bootstrap_ci(results, n_boot=400, seed=99)
+        self.assertIsNotNone(ci)
+        assert ci is not None
+        # Since CDR resamples {100, 60} at work level, CI spans [60..85]-ish and is strictly valid
+        self.assertLessEqual(ci[0], ci[1])
+        self.assertGreaterEqual(ci[0], 0.0)
+        self.assertLessEqual(ci[1], 100.0)
+
+    def test_catastrophic_penalty_refinements(self) -> None:
+        # 1. Unparseable short-circuits to ("unparseable",) only, even with n_pred=0, m_pred=0, bsvr=0
+        p_unparse = PageMetrics(
+            "p_bad", "w1", "RWP", "T2",
+            0.0, 0.0, 0.0, 0.0, 0.0, 100.0,
+            parseable=False, n_gt=50, n_pred=0, m_gt=8, m_pred=0, bsvr=0.0,
+        )
+        is_cf, reasons, mult, eff_wfpp = compute_catastrophic_penalties(p_unparse)
+        self.assertTrue(is_cf)
+        self.assertEqual(reasons, ("unparseable",))
+        self.assertEqual(mult, 0.0)
+        self.assertAlmostEqual(eff_wfpp, 120.0)
+
+        # 2. 1-bar difference on a 2-3 bar excerpt does NOT trigger structural_collapse
+        p_short_ok = PageMetrics(
+            "p_short", "w2", "CDR", "T0",
+            0.9, 0.9, 0.9, 0.9, 5.0, 50.0,
+            n_gt=12, n_pred=12, m_gt=3, m_pred=2, bsvr=1.0,
+        )
+        is_cf_ok, reasons_ok, _, _ = compute_catastrophic_penalties(p_short_ok)
+        self.assertFalse(is_cf_ok)
+        self.assertNotIn("structural_collapse", reasons_ok)
+
+        p_short_bad = PageMetrics(
+            "p_short_bad", "w2", "CDR", "T0",
+            0.9, 0.9, 0.9, 0.9, 5.0, 50.0,
+            n_gt=12, n_pred=12, m_gt=3, m_pred=5, bsvr=1.0,
+        )
+        is_cf_bad, reasons_bad, _, _ = compute_catastrophic_penalties(p_short_bad)
+        self.assertTrue(is_cf_bad)
+        self.assertIn("structural_collapse", reasons_bad)
+
+        # 3. Tacet music page (m_gt > 0, n_gt == 0): 1 spurious note does NOT trigger hallucination_loop
+        p_tacet = PageMetrics(
+            "p_tacet", "w3", "CDR", "T1",
+            0.0, 0.95, 0.95, 0.0, 2.0, 40.0,
+            n_gt=0, n_pred=1, m_gt=16, m_pred=16, bsvr=1.0,
+        )
+        res_tacet = compute_page_quality(p_tacet)
+        self.assertFalse(res_tacet.catastrophic_failure)
+        self.assertNotIn("hallucination_loop", res_tacet.cf_reasons)
+        self.assertGreater(res_tacet.q_score, 0.0)
+
+        # Tacet page with explicit repetition loop DOES trigger hallucination_loop and zero Q
+        p_tacet_loop = PageMetrics(
+            "p_tacet_loop", "w3", "CDR", "T1",
+            0.0, 0.95, 0.95, 0.0, 2.0, 40.0,
+            n_gt=0, n_pred=10, m_gt=16, m_pred=16, bsvr=1.0, has_repetition_loop=True,
+        )
+        res_tacet_loop = compute_page_quality(p_tacet_loop)
+        self.assertTrue(res_tacet_loop.catastrophic_failure)
+        self.assertIn("hallucination_loop", res_tacet_loop.cf_reasons)
+        self.assertEqual(res_tacet_loop.q_score, 0.0)
 
 
 if __name__ == "__main__":

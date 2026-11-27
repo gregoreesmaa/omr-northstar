@@ -3,7 +3,7 @@
 Zero external dependencies (Python 3.10+ standard library only).
 Implements transposition-invariant and tempo/divisions-invariant symbolic
 pitch-interval + IOI-ratio 8-gram hashing as specified in
-docs/01-architecture-and-governance.md (Section 3.2).
+docs/01-architecture-and-governance.md (Section 5.2).
 """
 
 from __future__ import annotations
@@ -45,49 +45,103 @@ def _iter_children(elem: ET.Element, name: str) -> list[ET.Element]:
     return [child for child in elem if _strip_ns(child.tag) == name]
 
 
+def _parse_positive_fraction(text: str | None) -> Fraction | None:
+    if not text:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        val = Fraction(stripped)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return val if val > 0 else None
+
+
+def _parse_nonneg_fraction(text: str | None) -> Fraction | None:
+    if not text:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        val = Fraction(stripped)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return val if val >= 0 else None
+
+
+def _parse_alter(text: str | None) -> int:
+    if not text:
+        return 0
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    try:
+        return int(round(Fraction(stripped)))
+    except (ValueError, ZeroDivisionError):
+        return 0
+
+
 def _extract_voice_note_streams(musicxml_str: str) -> list[list[tuple[Fraction, int]]]:
-    """Extract ordered (onset_beats, midi_pitch) streams per (part, voice)."""
+    """Extract ordered skyline (onset_beats, midi_pitch) streams per (part, staff, voice)."""
     root = ET.fromstring(musicxml_str)
     streams: list[list[tuple[Fraction, int]]] = []
 
     for part in _iter_children(root, "part"):
-        divisions = 1
+        divisions = Fraction(1)
         cursor = Fraction(0)
         last_onset = Fraction(0)
-        voice_events: dict[str, list[tuple[Fraction, int]]] = defaultdict(list)
+        voice_events: dict[tuple[str, str], dict[Fraction, int]] = defaultdict(dict)
 
         for measure in _iter_children(part, "measure"):
+            measure_start = cursor
+            measure_end = cursor
             for child in measure:
                 tag = _strip_ns(child.tag)
                 if tag == "attributes":
                     div_el = _find_child(child, "divisions")
-                    if div_el is not None and div_el.text:
-                        parsed_div = int(div_el.text.strip())
-                        if parsed_div > 0:
-                            divisions = parsed_div
+                    parsed_div = _parse_positive_fraction(
+                        div_el.text if div_el is not None else None
+                    )
+                    if parsed_div is not None:
+                        divisions = parsed_div
                 elif tag == "backup":
                     dur_el = _find_child(child, "duration")
-                    if dur_el is not None and dur_el.text:
-                        cursor -= Fraction(int(dur_el.text.strip()), divisions)
+                    dur_val = _parse_nonneg_fraction(
+                        dur_el.text if dur_el is not None else None
+                    )
+                    if dur_val is not None:
+                        cursor = max(measure_start, cursor - (dur_val / divisions))
+                        last_onset = cursor
                 elif tag == "forward":
                     dur_el = _find_child(child, "duration")
-                    if dur_el is not None and dur_el.text:
-                        cursor += Fraction(int(dur_el.text.strip()), divisions)
+                    dur_val = _parse_nonneg_fraction(
+                        dur_el.text if dur_el is not None else None
+                    )
+                    if dur_val is not None:
+                        cursor += dur_val / divisions
+                        last_onset = cursor
+                        if cursor > measure_end:
+                            measure_end = cursor
                 elif tag == "note":
                     is_grace = _find_child(child, "grace") is not None
                     is_chord = _find_child(child, "chord") is not None
                     dur_el = _find_child(child, "duration")
-                    dur = (
-                        Fraction(int(dur_el.text.strip()), divisions)
-                        if (dur_el is not None and dur_el.text and not is_grace)
-                        else Fraction(0)
+                    dur_val = (
+                        _parse_nonneg_fraction(dur_el.text)
+                        if (dur_el is not None and not is_grace)
+                        else None
                     )
+                    dur = (dur_val / divisions) if dur_val is not None else Fraction(0)
                     if is_chord:
                         onset = last_onset
                     else:
                         onset = cursor
                         last_onset = cursor
                         cursor += dur
+                        if cursor > measure_end:
+                            measure_end = cursor
 
                     if is_grace or _find_child(child, "rest") is not None:
                         continue
@@ -97,36 +151,50 @@ def _extract_voice_note_streams(musicxml_str: str) -> list[list[tuple[Fraction, 
                         continue
                     step_el = _find_child(pitch_el, "step")
                     oct_el = _find_child(pitch_el, "octave")
-                    if (
-                        step_el is None
-                        or not step_el.text
-                        or oct_el is None
-                        or not oct_el.text
-                    ):
+                    step_text = (
+                        step_el.text.strip().upper()
+                        if (step_el is not None and step_el.text)
+                        else ""
+                    )
+                    oct_text = (
+                        oct_el.text.strip()
+                        if (oct_el is not None and oct_el.text)
+                        else ""
+                    )
+                    if not step_text or not oct_text or step_text not in _STEP_TO_SEMITONE:
                         continue
-                    step = step_el.text.strip().upper()
-                    if step not in _STEP_TO_SEMITONE:
+                    try:
+                        octave = int(oct_text)
+                    except ValueError:
                         continue
                     alter_el = _find_child(pitch_el, "alter")
-                    alter = (
-                        int(round(float(alter_el.text.strip())))
-                        if (alter_el is not None and alter_el.text)
-                        else 0
-                    )
-                    octave = int(oct_el.text.strip())
-                    midi = (octave + 1) * 12 + _STEP_TO_SEMITONE[step] + alter
+                    alter = _parse_alter(alter_el.text if alter_el is not None else None)
+                    midi = (octave + 1) * 12 + _STEP_TO_SEMITONE[step_text] + alter
 
+                    staff_el = _find_child(child, "staff")
+                    staff = (
+                        staff_el.text.strip()
+                        if (staff_el is not None and staff_el.text and staff_el.text.strip())
+                        else "1"
+                    )
                     voice_el = _find_child(child, "voice")
                     voice = (
                         voice_el.text.strip()
-                        if (voice_el is not None and voice_el.text)
+                        if (voice_el is not None and voice_el.text and voice_el.text.strip())
                         else "1"
                     )
-                    voice_events[voice].append((onset, midi))
+                    onset_map = voice_events[(staff, voice)]
+                    prev_midi = onset_map.get(onset)
+                    if prev_midi is None or midi > prev_midi:
+                        onset_map[onset] = midi
 
-        for voice in sorted(voice_events):
-            events = sorted(voice_events[voice], key=lambda ev: (ev[0], ev[1]))
-            if events:
+            cursor = measure_end
+            last_onset = measure_end
+
+        for key in sorted(voice_events):
+            onset_map = voice_events[key]
+            if onset_map:
+                events = sorted(onset_map.items(), key=lambda ev: ev[0])
                 streams.append(events)
 
     return streams
@@ -148,34 +216,33 @@ def compute_symbolic_8gram_hashes(
 ) -> list[str]:
     """Extract transposition- and tempo-invariant symbolic n-gram SHA-256 hashes.
 
-    For every contiguous window of ``n`` notes in each ``(part, voice)`` stream,
-    encodes the ``n - 1`` semitone pitch intervals and ``n - 2`` exact rational
-    inter-onset-interval (IOI) ratios, then hashes the canonical representation
-    with salted SHA-256.
+    For every contiguous window of ``n`` skyline notes in each
+    ``(part, staff, voice)`` stream, encodes the ``n - 1`` semitone pitch
+    intervals and ``n - 2`` exact rational inter-onset-interval (IOI) ratios,
+    then hashes the canonical representation with salted SHA-256.
     """
     if n < 3:
         raise ValueError("n must be at least 3 to form pitch intervals and IOI ratios.")
 
     streams = _extract_voice_note_streams(musicxml_str)
     digests: list[str] = []
+    prefix = f"{salt}:v1|n={n}|dp="
 
     for events in streams:
         if len(events) < n:
             continue
+        pitch_intervals = [
+            str(events[i + 1][1] - events[i][1]) for i in range(len(events) - 1)
+        ]
+        iois = [events[i + 1][0] - events[i][0] for i in range(len(events) - 1)]
+        ioi_ratios = [
+            _format_ioi_ratio(iois[i + 1], iois[i]) for i in range(len(iois) - 1)
+        ]
         for start in range(len(events) - n + 1):
-            window = events[start : start + n]
-            pitch_intervals = [
-                window[i + 1][1] - window[i][1] for i in range(n - 1)
-            ]
-            iois = [window[i + 1][0] - window[i][0] for i in range(n - 1)]
-            ioi_ratios = [
-                _format_ioi_ratio(iois[i + 1], iois[i]) for i in range(n - 2)
-            ]
-            canonical = (
-                f"v1|n={n}|dp={','.join(str(d) for d in pitch_intervals)}"
-                f"|ioir={','.join(ioi_ratios)}"
-            )
-            digest = hashlib.sha256(f"{salt}:{canonical}".encode("utf-8")).hexdigest()
+            dp_str = ",".join(pitch_intervals[start : start + n - 1])
+            ioir_str = ",".join(ioi_ratios[start : start + n - 2])
+            payload = f"{prefix}{dp_str}|ioir={ioir_str}"
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
             digests.append(digest)
 
     return digests

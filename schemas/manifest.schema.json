@@ -16,6 +16,11 @@
       "type": "string",
       "const": "1.0.0"
     },
+    "manifest_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional semantic version of the manifest pack (e.g., 0.1.0)."
+    },
     "benchmark_version": {
       "type": "string",
       "minLength": 1,
@@ -50,6 +55,16 @@
     "description": {
       "type": "string",
       "description": "Optional human-readable manifest notes."
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional top-level SPDX license identifier for the manifest pack."
+    },
+    "ground_truth_files": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "minLength": 1 },
+      "description": "Optional mapping from page_id to relative ground-truth file path."
     },
     "visual_severity_scale": {
       "type": "array",

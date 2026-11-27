@@ -182,7 +182,9 @@ def score_ostinato_trap(
             tsr = 1.0
         else:
             hits = sum(
-                1 for k, v in gt_mutated_sites.items() if pred_mutated_sites.get(k) == v
+                1
+                for k, v in gt_mutated_sites.items()
+                if k in pred_mutated_sites and pred_mutated_sites[k] == v
             )
             tsr = hits / len(gt_mutated_sites)
     elif isinstance(gt_mutated_sites, (set, frozenset)) or isinstance(
@@ -257,7 +259,11 @@ def score_counterfactual_trap(
         for p, orig, mut in zip(pred_at_sites, original_at_sites, mutated_at_sites)
         if p == orig and p != mut
     )
-    matched = sum(1 for p, mut in zip(pred_at_sites, mutated_at_sites) if p == mut)
+    matched = sum(
+        1
+        for p, mut in zip(pred_at_sites, mutated_at_sites)
+        if p is not None and p == mut
+    )
     n_pred_present = sum(1 for p in pred_at_sites if p is not None)
 
     phr = reverted / n
@@ -296,8 +302,8 @@ def score_positional_decay(
       - q4_q1_ratio >= 0.95
       - system_completeness == 1.0
     """
-    if q1_f1 < 0.0 or q4_f1 < 0.0:
-        raise ValueError("F1 scores must be non-negative.")
+    if not (0.0 <= q1_f1 <= 1.0 and 0.0 <= q4_f1 <= 1.0):
+        raise ValueError("F1 scores must lie in [0.0, 1.0].")
     if pred_systems < 0 or gt_systems < 0:
         raise ValueError("System counts must be non-negative.")
 
@@ -473,6 +479,75 @@ def score_annotation_invariance(
 # Pillar 4: Parametric MusicXML Trap Generator
 # ---------------------------------------------------------------------------
 
+_POST_ACCIDENTAL_TAGS: frozenset[str] = frozenset(
+    {
+        "time-modification",
+        "stem",
+        "notehead",
+        "notehead-text",
+        "staff",
+        "beam",
+        "notations",
+        "lyric",
+        "play",
+        "listen",
+    }
+)
+
+
+def _local_tag(tag: str) -> str:
+    """Strip optional XML namespace URI from an ElementTree tag."""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+
+def _ns_prefix(tag: str) -> str:
+    """Return '{namespace}' prefix if present, else empty string."""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[0] + "}"
+    return ""
+
+
+def _find_child(elem: ET.Element, name: str) -> ET.Element | None:
+    for child in elem:
+        if _local_tag(child.tag) == name:
+            return child
+    return None
+
+
+def _iter_children(elem: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in elem if _local_tag(child.tag) == name]
+
+
+def _key_signature_alters(fifths: int) -> dict[str, int]:
+    """Return per-step default alteration from key signature fifths."""
+    alters: dict[str, int] = {s: 0 for s in ("C", "D", "E", "F", "G", "A", "B")}
+    sharp_order = ("F", "C", "G", "D", "A", "E", "B")
+    flat_order = ("B", "E", "A", "D", "G", "C", "F")
+    if fifths > 0:
+        for s in sharp_order[: min(fifths, 7)]:
+            alters[s] = 1
+    elif fifths < 0:
+        for s in flat_order[: min(-fifths, 7)]:
+            alters[s] = -1
+    return alters
+
+
+def _insert_accidental_element(note_el: ET.Element, acc_text: str) -> ET.Element:
+    """Set or insert <accidental> in valid MusicXML 3.1/4.0 XSD child order."""
+    acc_el = _find_child(note_el, "accidental")
+    if acc_el is None:
+        acc_el = ET.Element(f"{_ns_prefix(note_el.tag)}accidental")
+        insert_idx = len(note_el)
+        for idx, child in enumerate(note_el):
+            if _local_tag(child.tag) in _POST_ACCIDENTAL_TAGS:
+                insert_idx = idx
+                break
+        note_el.insert(insert_idx, acc_el)
+    acc_el.text = acc_text
+    return acc_el
+
 
 def _format_pitch(step: str, alter: int, octave: int) -> str:
     return f"{step}{_ALTER_TO_SYMBOL.get(alter, str(alter))}{octave}"
@@ -559,6 +634,31 @@ def generate_ostinato_trap_musicxml(
             ET.SubElement(clef, "line").text = "2"
 
         plan = bar_mutation_plan.get(bar_num)
+        key_alters = _key_signature_alters(0)
+        active_alter: dict[tuple[str, int], int] = {}
+
+        def _append_note(
+            note_step: str,
+            note_alter: int,
+            note_oct: int,
+            duration: int,
+            note_type: str,
+        ) -> None:
+            key = (note_step, note_oct)
+            current = active_alter.get(key, key_alters[note_step])
+            show_acc = note_alter != current
+            active_alter[key] = note_alter
+            measure.append(
+                _build_note_element(
+                    note_step,
+                    note_alter,
+                    note_oct,
+                    duration=duration,
+                    note_type=note_type,
+                    show_accidental=show_acc,
+                )
+            )
+
         for note_idx, (step, alter, octave) in enumerate(base_pattern):
             if plan is not None and plan[0] == note_idx:
                 mtype = plan[1]
@@ -567,16 +667,7 @@ def generate_ostinato_trap_musicxml(
                     candidates = [a for a in (-1, 0, 1) if a != alter]
                     new_alter = rng.choice(candidates)
                     new_pitch = _format_pitch(step, new_alter, octave)
-                    measure.append(
-                        _build_note_element(
-                            step,
-                            new_alter,
-                            octave,
-                            duration=2,
-                            note_type="eighth",
-                            show_accidental=True,
-                        )
-                    )
+                    _append_note(step, new_alter, octave, duration=2, note_type="eighth")
                     mutations_meta.append(
                         {
                             "measure": bar_num,
@@ -587,25 +678,8 @@ def generate_ostinato_trap_musicxml(
                         }
                     )
                 else:  # rhythm_split: 1 eighth -> 2 sixteenths (preserves 4/4 bar sum)
-                    measure.append(
-                        _build_note_element(
-                            step,
-                            alter,
-                            octave,
-                            duration=1,
-                            note_type="16th",
-                            show_accidental=(alter != 0),
-                        )
-                    )
-                    measure.append(
-                        _build_note_element(
-                            step,
-                            alter,
-                            octave,
-                            duration=1,
-                            note_type="16th",
-                        )
-                    )
+                    _append_note(step, alter, octave, duration=1, note_type="16th")
+                    _append_note(step, alter, octave, duration=1, note_type="16th")
                     mutations_meta.append(
                         {
                             "measure": bar_num,
@@ -616,16 +690,7 @@ def generate_ostinato_trap_musicxml(
                         }
                     )
             else:
-                measure.append(
-                    _build_note_element(
-                        step,
-                        alter,
-                        octave,
-                        duration=2,
-                        note_type="eighth",
-                        show_accidental=(alter != 0),
-                    )
-                )
+                _append_note(step, alter, octave, duration=2, note_type="eighth")
 
     ET.indent(score, space="  ")
     xml_str = ET.tostring(score, encoding="unicode", xml_declaration=True)
@@ -659,14 +724,14 @@ def generate_counterfactual_musicxml(
     pitched_entries: list[tuple[str, str, int, int, ET.Element]] = []
 
     global_idx = 0
-    for part in root.findall("part"):
+    for part in _iter_children(root, "part"):
         part_id = part.attrib.get("id", "P1")
-        for measure in part.findall("measure"):
+        for measure in _iter_children(part, "measure"):
             measure_num = measure.attrib.get("number", "1")
             note_idx = 0
-            for note in measure.findall("note"):
-                pitch = note.find("pitch")
-                if pitch is not None and note.find("rest") is None:
+            for note in _iter_children(measure, "note"):
+                pitch = _find_child(note, "pitch")
+                if pitch is not None and _find_child(note, "rest") is None:
                     pitched_entries.append(
                         (part_id, measure_num, note_idx, global_idx, note)
                     )
@@ -684,18 +749,36 @@ def generate_counterfactual_musicxml(
     mutation_sites: list[dict[str, Any]] = []
     for idx in chosen_indices:
         part_id, measure_num, note_idx, g_idx, note_el = pitched_entries[idx]
-        pitch_el = note_el.find("pitch")
+        pitch_el = _find_child(note_el, "pitch")
         assert pitch_el is not None
 
-        step_el = pitch_el.find("step")
-        oct_el = pitch_el.find("octave")
-        if step_el is None or step_el.text is None or oct_el is None or oct_el.text is None:
+        step_el = _find_child(pitch_el, "step")
+        oct_el = _find_child(pitch_el, "octave")
+        step_text = (
+            step_el.text.strip()
+            if (step_el is not None and step_el.text)
+            else ""
+        )
+        oct_text = (
+            oct_el.text.strip()
+            if (oct_el is not None and oct_el.text)
+            else ""
+        )
+        if not step_text or not oct_text:
+            continue
+        try:
+            orig_oct = int(oct_text)
+        except ValueError:
             continue
 
-        step = step_el.text.strip()
-        alter_el = pitch_el.find("alter")
-        orig_alter = int(alter_el.text.strip()) if (alter_el is not None and alter_el.text) else 0
-        orig_oct = int(oct_el.text.strip())
+        step = step_text
+        alter_el = _find_child(pitch_el, "alter")
+        orig_alter = 0
+        if alter_el is not None and alter_el.text and alter_el.text.strip():
+            try:
+                orig_alter = int(round(float(alter_el.text.strip())))
+            except ValueError:
+                orig_alter = 0
         orig_pitch = _format_pitch(step, orig_alter, orig_oct)
 
         mtype = rng.choice(("accidental", "octave"))
@@ -703,16 +786,15 @@ def generate_counterfactual_musicxml(
             candidates = [a for a in (-1, 0, 1) if a != orig_alter]
             new_alter = rng.choice(candidates)
             if alter_el is None:
-                alter_el = ET.Element("alter")
+                alter_el = ET.Element(f"{_ns_prefix(pitch_el.tag)}alter")
                 # Insert <alter> immediately after <step> per MusicXML schema.
                 step_pos = list(pitch_el).index(step_el)
                 pitch_el.insert(step_pos + 1, alter_el)
             alter_el.text = str(new_alter)
 
-            acc_el = note_el.find("accidental")
-            if acc_el is None:
-                acc_el = ET.SubElement(note_el, "accidental")
-            acc_el.text = _ALTER_TO_ACCIDENTAL.get(new_alter, "natural")
+            _insert_accidental_element(
+                note_el, _ALTER_TO_ACCIDENTAL.get(new_alter, "natural")
+            )
             new_pitch = _format_pitch(step, new_alter, orig_oct)
         else:
             if orig_oct <= 2:

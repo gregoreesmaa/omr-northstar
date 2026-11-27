@@ -35,5 +35,13 @@ classifiers = [
 [project.scripts]
 omr-northstar = "omr_northstar.cli:main"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 include = ["omr_northstar*"]
+
+[tool.setuptools.data-files]
+"share/omr-northstar/schemas" = ["schemas/*.schema.json"]
+"share/omr-northstar/pilot_dev_v0_1" = ["pilot_dev_v0_1/manifest.json", "pilot_dev_v0_1/README.md"]
+"share/omr-northstar/pilot_dev_v0_1/gt" = ["pilot_dev_v0_1/gt/*.musicxml"]

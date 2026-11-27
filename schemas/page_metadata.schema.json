@@ -251,6 +251,25 @@
   "allOf": [
     {
       "if": {
+        "properties": { "is_negative_control": { "const": true } },
+        "required": ["is_negative_control"]
+      },
+      "then": {},
+      "else": {
+        "required": ["staff_space_px"],
+        "properties": {
+          "staff_space_px": {
+            "type": "object",
+            "required": ["median"],
+            "properties": {
+              "median": { "type": "number", "exclusiveMinimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
         "properties": { "track": { "const": "research_nc_eval_only" } },
         "required": ["track"]
       },

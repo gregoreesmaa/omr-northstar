@@ -13,6 +13,7 @@ from .cer import (
     parse_musicxml,
     score_musicxml_pair,
 )
+from .compare import compare_reports, format_comparison
 from .scoring import (
     DOMAINS,
     TIER_WEIGHTS,
@@ -34,6 +35,12 @@ from .scoring import (
     compute_tier_scores,
     compute_tier_weighted_ns,
 )
+from .validate import (
+    validate_disjoint_splits,
+    validate_manifest,
+    validate_page_records,
+    validate_report,
+)
 
 __all__ = [
     "DOMAINS",
@@ -52,6 +59,7 @@ __all__ = [
     "align_and_score_cer",
     "align_measures",
     "build_report",
+    "compare_reports",
     "compute_catastrophic_penalties",
     "compute_effective_measure_cost",
     "compute_northstar_score",
@@ -64,8 +72,13 @@ __all__ = [
     "compute_stratum_scores",
     "compute_tier_scores",
     "compute_tier_weighted_ns",
+    "format_comparison",
     "parse_musicxml",
     "score_musicxml_pair",
+    "validate_disjoint_splits",
+    "validate_manifest",
+    "validate_page_records",
+    "validate_report",
 ]
 
 __version__ = "1.0.0"

@@ -11,26 +11,26 @@ License: `CC0-1.0` (Public Domain Dedication)
 
 | Page ID | Work ID | Domain | Tier | Visual | Anchor ID | Protocol | Engraver / Writer | Musical Content |
 |---|---|---|---|---|---|---|---|---|
-| `ns-pilot-001` | `pilot-w01` | `CDR` | `T0` | `E` | `anchor-t0-melody` | `B` | LilyPond 2.24 | Monophonic C-major melody |
-| `ns-pilot-002` | `pilot-w02` | `CDR` | `T1` | `E` | `anchor-t1-piano` | `A` | Dorico 5 | 2-staff grand-staff piano with chords, dynamics & slurs |
-| `ns-pilot-003` | `pilot-w02` | `CDR` | `T1` | `E` | `anchor-t1-piano` | `A` | Verovio 4.3 | Same grand-staff anchor in 2nd engraver (Protocol A) |
-| `ns-pilot-004` | `pilot-w03` | `ALS` | `T2` | `M` | `anchor-t2-counterpoint` | `B` | Breitkopf & Haertel (1898) | 2-voice counterpoint + lyrics + alto-clef viola |
+| `ns-pilot-001` | `pilot-w01` | `CDR` | `T0` | `E` | `anchor-t0-melody` | `A` | LilyPond 2.24 | Monophonic C-major melody |
+| `ns-pilot-002` | `pilot-w02` | `CDR` | `T1` | `E` | `anchor-t1-piano` | `B` | Dorico 5 | 2-staff grand-staff piano with chords, dynamics & slurs |
+| `ns-pilot-003` | `pilot-w02` | `CDR` | `T1` | `E` | `anchor-t1-piano` | `B` | Verovio 4.3 | Same grand-staff anchor in 2nd engraver (Protocol B) |
+| `ns-pilot-004` | `pilot-w03` | `ALS` | `T2` | `M` | `anchor-t2-counterpoint` | `A` | Breitkopf & Haertel (1898) | 2-voice counterpoint + lyrics + alto-clef viola |
 | `ns-pilot-005` | `pilot-w04` | `ALS` | `T3` | `M` | — | — | Edition Peters (1904) | 4-staff chamber score with Bb Clarinet transposition & 2-bar multi-measure rest |
-| `ns-pilot-006` | `pilot-w05` | `ALS` | `T0` | `E` | — | — | Baerenreiter (1952) | **Negative control**: blank staff (0 notes, stress family `2A`) |
-| `ns-pilot-007` | `pilot-w01` | `RWP` | `T0` | `M` | `anchor-t0-melody` | `B` | LilyPond 2.24 | Paired phone-photo capture of `ns-pilot-001` |
-| `ns-pilot-008` | `pilot-w03` | `RWP` | `T2` | `H` | `anchor-t2-counterpoint` | `B` | Breitkopf & Haertel (1898) | Paired phone-photo capture of `ns-pilot-004` |
+| `ns-pilot-006` | `pilot-w05` | `ALS` | `T0` | `E` | — | — | Baerenreiter (1952) | **Negative control**: blank staff (0 notes, stress family `3B`) |
+| `ns-pilot-007` | `pilot-w01` | `RWP` | `T0` | `M` | `anchor-t0-melody` | `A` | LilyPond 2.24 | Paired phone-photo capture of `ns-pilot-001` |
+| `ns-pilot-008` | `pilot-w03` | `RWP` | `T2` | `H` | `anchor-t2-counterpoint` | `A` | Breitkopf & Haertel (1898) | Paired phone-photo capture of `ns-pilot-004` |
 | `ns-pilot-009` | `pilot-w06` | `RWP` | `T4` | `H` | — | — | Schott Music | Asymmetric `7/8` meter + triplet tuplet + mid-measure clef & key change |
-| `ns-pilot-010` | `pilot-w02` | `HWM` | `T1` | `H` | `anchor-t1-piano` | `C` | `writer-pilot-01` | Paired handwritten manuscript of `anchor-t1-piano` |
+| `ns-pilot-010` | `pilot-w02` | `HWM` | `T1` | `H` | `anchor-t1-piano` | `D2` | `writer-pilot-01` | Paired handwritten manuscript of `anchor-t1-piano` |
 | `ns-pilot-011` | `pilot-w07` | `HWM` | `T5` | `B` | — | — | `writer-pilot-02` | Ostinato trap (bar-4 `G#` mutation) + counterfactual accidentals (`1A`, `1B`) |
 | `ns-pilot-012` | `pilot-w08` | `HWM` | `T4` | `B` | — | — | `writer-pilot-03` | Handwritten `7/8` meter + triplet tuplet + mid-measure clef & key change |
 
 ## Governance Notes
 
 - **Paired Isolation Protocols**:
-  - Protocol A (`anchor-t1-piano`, `CDR`↔`CDR`): Dorico 5 vs. Verovio 4.3 yields `delta_engraver`.
-  - Protocol B (`anchor-t0-melody`, `anchor-t2-counterpoint`, `CDR`/`ALS`↔`RWP`): yields `delta_photo`.
-  - Protocol C (`anchor-t1-piano`, `CDR`↔`HWM`): yields `delta_handwriting`.
-- **Engraver & Writer Diversity (Pilot Scale)**: 7 distinct engravers/publishers and 3 distinct manuscript writers are represented across the 12 pages. Because Protocol B pairs an identical print across `CDR`/`ALS` and `RWP`, two engravers appear twice (`2/12 = 16.7%`, a pilot-pack scale artifact; full `dev-v1`/`test-v1` releases enforce `<= 15%` per engraver).
+  - Protocol A (`anchor-t0-melody`, `anchor-t2-counterpoint`, `CDR`/`ALS`↔`RWP`): Capture Ladder/Photo pairs yielding `delta_photo`.
+  - Protocol B (`anchor-t1-piano`, `CDR`↔`CDR`): Multi-Engraver Dorico 5 vs. Verovio 4.3 yielding `delta_engraver`.
+  - Protocol D2 (`anchor-t1-piano`, `CDR`↔`HWM`): Handwritten calligraphic-variance pair yielding `delta_handwriting`.
+- **Engraver & Writer Diversity (Pilot Scale)**: 7 distinct engravers/publishers and 3 distinct manuscript writers are represented across the 12 pages. Because Protocol A pairs an identical print across `CDR`/`ALS` and `RWP`, two engravers appear twice (`2/12 = 16.7%`, a pilot-pack scale artifact; full `dev-v1`/`test-v1` releases enforce `<= 15%` per engraver).
 - **Negative Control**: `ns-pilot-006` is an explicit empty/blank-staff score (`0` notes) verifying that systems do not hallucinate notes on empty staves.
 
 ## Running Baselines

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+import zipfile
 from fractions import Fraction
+from pathlib import Path
 
 from omr_northstar.cer import (
+    _extract_sounding_events,
+    _measure_similarity,
     align_and_score_cer,
     align_measures,
     parse_musicxml,
+    parse_musicxml_file,
     score_musicxml_pair,
 )
 from omr_northstar.scoring import DOMAINS, ERROR_BUCKET_KEYS, build_report, compute_page_quality
@@ -723,6 +729,403 @@ class TestRepetitionLoopVsOstinato(unittest.TestCase):
         )
         res = align_and_score_cer(parse_musicxml(pred_xml), parse_musicxml(gt_xml))
         self.assertTrue(res.has_repetition_loop)
+
+    def test_five_bar_repetition_loop_detected(self) -> None:
+        """Longer n-gram (n=5) runaway repetition loop must be flagged."""
+        pat = [
+            [("C", 4, 4)],
+            [("D", 4, 4)],
+            [("E", 4, 4)],
+            [("F", 4, 4)],
+            [("G", 4, 4)],
+        ]
+        gt_bars = [
+            [("C", 4, 4)],
+            [("D", 4, 4)],
+            [("E", 4, 4)],
+            [("F", 4, 4)],
+            [("G", 4, 4)],
+            [("A", 4, 4)],
+            [("B", 4, 4)],
+            [("C", 5, 4)],
+        ]
+        gt_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, b, with_attrs=(i == 0)) for i, b in enumerate(gt_bars))
+        )
+        pred_bars = pat * 3  # 15 measures repeating 5-bar chunk 3x
+        pred_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, b, with_attrs=(i == 0)) for i, b in enumerate(pred_bars))
+        )
+        res = align_and_score_cer(parse_musicxml(pred_xml), parse_musicxml(gt_xml))
+        self.assertTrue(res.has_repetition_loop)
+
+
+class TestCERBugFixesAndInvariants(unittest.TestCase):
+    """Comprehensive tests for chord invariance, cross-staff BSVR, part bijection, S_play, and parser edge cases."""
+
+    def test_chord_order_invariance_and_articulation_chord_invariance(self) -> None:
+        """Reversing chord serialization order and moving articulation across chord notes yields 1.0."""
+        attrs = (
+            "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+        )
+        gt_xml = _wrap_partwise(
+            f'<measure number="1">{attrs}'
+            + _note_xml("C", 4, 4, staccato=True)
+            + _note_xml("E", 4, 4, chord=True)
+            + _note_xml("G", 4, 4, chord=True)
+            + "</measure>"
+        )
+        pred_xml = _wrap_partwise(
+            f'<measure number="1">{attrs}'
+            + _note_xml("G", 4, 4)
+            + _note_xml("E", 4, 4, chord=True, staccato=True)
+            + _note_xml("C", 4, 4, chord=True)
+            + "</measure>"
+        )
+        res = align_and_score_cer(parse_musicxml(pred_xml), parse_musicxml(gt_xml))
+        self.assertAlmostEqual(res.f1_t1c, 1.0)
+        self.assertAlmostEqual(res.mer, 1.0)
+        self.assertAlmostEqual(res.s_expr, 1.0)
+        self.assertAlmostEqual(res.bsvr, 1.0)
+
+    def test_cross_staff_chord_and_cross_staff_voice_bsvr(self) -> None:
+        """Cross-staff chords clear orphaned is_chord=True and cross-staff voices achieve BSVR=1.0."""
+        m1 = (
+            '<measure number="1">'
+            "<attributes><divisions>1</divisions><staves>2</staves>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            '<clef number="1"><sign>G</sign><line>2</line></clef>'
+            '<clef number="2"><sign>F</sign><line>4</line></clef>'
+            "</attributes>"
+            # Beat 1: cross-staff chord (staff 1 root + staff 2 chord note)
+            + _note_xml("E", 4, 1, voice="1", staff=1)
+            + _note_xml("C", 3, 1, voice="1", staff=2, chord=True)
+            # Beats 2-4: voice 1 alternates between staff 2 and staff 1
+            + _note_xml("G", 3, 1, voice="1", staff=2)
+            + _note_xml("D", 4, 1, voice="1", staff=1)
+            + _note_xml("F", 3, 1, voice="1", staff=2)
+            + "</measure>"
+        )
+        score = parse_musicxml(_wrap_partwise(m1))
+        # Staff 2's first note at onset 0 must NOT have orphaned is_chord=True
+        s2_notes = score.measures[1].notes
+        self.assertFalse(s2_notes[0].is_chord)
+        res = align_and_score_cer(score, score)
+        self.assertAlmostEqual(res.bsvr, 1.0)
+        self.assertAlmostEqual(res.mer, 1.0)
+        self.assertAlmostEqual(res.s_struct, 1.0)
+
+    def test_hungarian_part_bijection_and_empty_gt_part_pruning(self) -> None:
+        """Reordered parts match via Hungarian bijection, and all-empty hidden GT parts are pruned."""
+        p1_xml = (
+            '  <part id="P1"><measure number="1">'
+            "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            + _note_xml("E", 5, 4)
+            + "</measure></part>\n"
+        )
+        p2_xml = (
+            '  <part id="P2"><measure number="1">'
+            "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>F</sign><line>4</line></clef></attributes>"
+            + _note_xml("C", 3, 4)
+            + "</measure></part>\n"
+        )
+        p_empty_xml = (
+            '  <part id="P3"><measure number="1">'
+            "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            '<note><rest measure="yes"/><duration>4</duration><voice>1</voice></note>'
+            "</measure></part>\n"
+        )
+        gt_xml = f'<?xml version="1.0"?><score-partwise>{p1_xml}{p2_xml}{p_empty_xml}</score-partwise>'
+        # Prediction has P2 and P1 in swapped order and omits the hidden empty part P3
+        pred_xml = f'<?xml version="1.0"?><score-partwise>{p2_xml}{p1_xml}</score-partwise>'
+        res = align_and_score_cer(parse_musicxml(pred_xml), parse_musicxml(gt_xml))
+        self.assertEqual(res.m_gt, 2)
+        self.assertEqual(res.m_pred, 2)
+        self.assertAlmostEqual(res.f1_t1c, 1.0)
+        self.assertAlmostEqual(res.mer, 1.0)
+        self.assertAlmostEqual(res.s_struct, 1.0)
+
+    def test_measure_similarity_no_barline_floor_and_pickup_shift_alignment(self) -> None:
+        """Unrelated measures get 0.0 similarity (no +0.30 floor), enabling clean pickup alignment."""
+        attrs = (
+            "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+        )
+        m0 = f'<measure number="0" implicit="yes">{attrs}' + _note_xml("G", 4, 1) + "</measure>"
+        m1 = '<measure number="1">' + _note_xml("C", 4, 4) + "</measure>"
+        m2 = '<measure number="2">' + _note_xml("D", 4, 4) + "</measure>"
+        gt = parse_musicxml(_wrap_partwise(m0 + m1 + m2))
+        pred = parse_musicxml(_wrap_partwise(f'<measure number="1">{attrs}' + _note_xml("C", 4, 4) + "</measure>" + m2))
+
+        self.assertEqual(_measure_similarity(gt.measures[0], gt.measures[1]), 0.0)
+        aln = align_measures(pred.measures, gt.measures)
+        self.assertEqual(aln, [(None, 0), (0, 1), (1, 2)])
+
+    def test_bsvr_pickup_complement_cadenza_anti_gaming_and_full_rest(self) -> None:
+        """Pickup/complement/split/senza-misura/full-measure rest pass BSVR; gaming implicit='yes' fails."""
+        attrs_34 = (
+            "<attributes><divisions>1</divisions><time><beats>3</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+        )
+        gt_xml = _wrap_partwise(
+            # Pickup measure number="0" (1 beat)
+            f'<measure number="0">{attrs_34}' + _note_xml("G", 4, 1) + "</measure>"
+            # Normal 3/4 measure with full-measure rest encoded as whole-note duration=4
+            + '<measure number="1"><note><rest measure="yes"/><duration>4</duration><voice>1</voice></note></measure>'
+            # Split measure number="X1"
+            + '<measure number="X1">' + _note_xml("C", 4, 1) + "</measure>"
+            # Senza-misura cadenza measure
+            + '<measure number="2"><attributes><time><senza-misura/></time></attributes>'
+            + _note_xml("D", 4, 5) + "</measure>"
+            # Return to 3/4 + final complement bar (2 beats)
+            + '<measure number="3"><attributes><time><beats>3</beats><beat-type>4</beat-type></time></attributes>'
+            + _note_xml("E", 4, 2) + "</measure>"
+        )
+        gt_score = parse_musicxml(gt_xml)
+        self.assertEqual(gt_score.measures[1].rests[0].duration, Fraction(3, 4))
+        res_gt = align_and_score_cer(gt_score, gt_score)
+        self.assertAlmostEqual(res_gt.bsvr, 1.0)
+        self.assertAlmostEqual(res_gt.mer, 1.0)
+
+        # Gaming attempt: pred marks a normal GT measure as implicit="yes" with underfull beats
+        normal_gt = parse_musicxml(
+            _wrap_partwise(f'<measure number="1">{attrs_34}' + _note_xml("C", 4, 3) + "</measure>")
+        )
+        gamed_pred = parse_musicxml(
+            _wrap_partwise(f'<measure number="1" implicit="yes">{attrs_34}' + _note_xml("C", 4, 1) + "</measure>")
+        )
+        res_game = align_and_score_cer(gamed_pred, normal_gt)
+        self.assertAlmostEqual(res_game.bsvr, 0.0)
+
+        # Non-implicit completely empty predicted measure aligned to non-empty GT fails BSVR
+        empty_pred = parse_musicxml(_wrap_partwise(f'<measure number="1">{attrs_34}</measure>'))
+        res_empty = align_and_score_cer(empty_pred, normal_gt)
+        self.assertAlmostEqual(res_empty.bsvr, 0.0)
+
+    def test_k_dropped_systems_multistaff_and_empty_breaks(self) -> None:
+        """Dropping 1 visual system on a 4-staff score counts k_dropped=1, not 4; empty breaks = 1 system."""
+        def _part_2sys(pid: str, step: str, include_sys2: bool) -> str:
+            attrs = (
+                "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+                "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            )
+            m1 = f'<measure number="1">{attrs}' + _note_xml(step, 4, 4) + "</measure>"
+            m2 = '<measure number="2"><print new-system="yes"/>' + _note_xml(step, 5, 4) + "</measure>"
+            return f'<part id="{pid}">{m1}{m2 if include_sys2 else ""}</part>'
+
+        gt_4 = (
+            '<?xml version="1.0"?><score-partwise>'
+            + _part_2sys("P1", "C", True)
+            + _part_2sys("P2", "D", True)
+            + _part_2sys("P3", "E", True)
+            + _part_2sys("P4", "F", True)
+            + "</score-partwise>"
+        )
+        pred_4 = (
+            '<?xml version="1.0"?><score-partwise>'
+            + _part_2sys("P1", "C", False)
+            + _part_2sys("P2", "D", False)
+            + _part_2sys("P3", "E", False)
+            + _part_2sys("P4", "F", False)
+            + "</score-partwise>"
+        )
+        res = align_and_score_cer(parse_musicxml(pred_4), parse_musicxml(gt_4))
+        self.assertEqual(res.k_dropped_systems, 1)
+
+        # Empty system_breaks treated as 1 system [0, m_gt)
+        gt_1 = parse_musicxml(
+            _wrap_partwise(
+                '<measure number="1"><attributes><divisions>1</divisions>'
+                "<time><beats>4</beats><beat-type>4</beat-type></time></attributes>"
+                + _note_xml("C", 4, 4) + "</measure>"
+            )
+        )
+        pred_empty = parse_musicxml(
+            _wrap_partwise(
+                '<measure number="1"><attributes><divisions>1</divisions>'
+                "<time><beats>4</beats><beat-type>4</beat-type></time></attributes></measure>"
+            )
+        )
+        self.assertEqual(align_and_score_cer(pred_empty, gt_1).k_dropped_systems, 1)
+
+    def test_sounding_events_tie_flush_contiguity_pickup_and_cross_staff(self) -> None:
+        """S_play flushes overwritten ties, requires contiguity, uses pickup duration, chains cross-staff ties."""
+        # 1. Overwritten tie_start + non-contiguous tie_stop
+        xml_ties = _wrap_partwise(
+            '<measure number="1"><attributes><divisions>1</divisions>'
+            "<time><beats>4</beats><beat-type>4</beat-type></time></attributes>"
+            + _note_xml("C", 4, 1, tie_start=True)
+            + _note_xml("C", 4, 1, tie_start=True)  # overwrites first -> must flush first
+            + "<note><rest/><duration>1</duration><voice>1</voice></note>"
+            + _note_xml("C", 4, 1, tie_stop=True)   # non-contiguous -> must not chain
+            + "</measure>"
+        )
+        ev = _extract_sounding_events(parse_musicxml(xml_ties))
+        self.assertEqual(sum(ev.values()), 3)
+        self.assertEqual(ev[(60, Fraction(0), Fraction(1, 4))], 1)
+        self.assertEqual(ev[(60, Fraction(1, 4), Fraction(1, 4))], 1)
+        self.assertEqual(ev[(60, Fraction(3, 4), Fraction(1, 4))], 1)
+
+        # 2. Pickup actual duration + cross-staff tie in grand-staff part
+        xml_xstaff = _wrap_partwise(
+            '<measure number="0" implicit="yes"><attributes><divisions>1</divisions><staves>2</staves>'
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            '<clef number="1"><sign>G</sign><line>2</line></clef>'
+            '<clef number="2"><sign>F</sign><line>4</line></clef></attributes>'
+            + _note_xml("C", 4, 1, voice="1", staff=1, tie_start=True)
+            + "</measure>"
+            + '<measure number="1">'
+            + _note_xml("C", 4, 4, voice="1", staff=2, tie_stop=True)
+            + "</measure>"
+        )
+        ev_xs = _extract_sounding_events(parse_musicxml(xml_xstaff))
+        self.assertEqual(ev_xs, {(60, Fraction(0), Fraction(5, 4)): 1})
+
+    def test_parser_decimals_zero_divisions_timewise_mxl_transpose_and_expressives(self) -> None:
+        """Verify decimals, divisions=0 fallback, timewise, .mxl, transpose, unpitched, wedges, and NFC."""
+        # 1. Decimal divisions/alter/duration, divisions=0 fallback, empty child text, negative duration clamp
+        xml_dec = _wrap_partwise(
+            '<measure number="1">'
+            "<attributes><divisions>0</divisions><transpose><chromatic>-2</chromatic><octave-change>-1</octave-change></transpose>"
+            "<time><beats>3</beats><beat-type>4</beat-type><beats>2</beats><beat-type>8</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line><clef-octave-change>-1</clef-octave-change></clef>"
+            "</attributes>"
+            "<note><pitch><step>C</step><alter>1.0</alter><octave>5</octave></pitch>"
+            "<type>quarter</type><dot/><voice>1</voice><staff> </staff>"
+            '<notations><tied type="continue"/></notations></note>'
+            "<note><unpitched><display-step>E</display-step><display-octave>4</display-octave></unpitched>"
+            "<type>eighth</type><voice>1</voice></note>"
+            "<note><rest/><type>half</type><voice>1</voice><notations><fermata/></notations></note>"
+            "</measure>"
+        )
+        sc = parse_musicxml(xml_dec)
+        m0 = sc.measures[0]
+        # Compound time 3/4 + 2/8 -> 8/8
+        self.assertEqual((m0.contexts[1].time_num, m0.contexts[1].time_den), (8, 8))
+        self.assertEqual(m0.contexts[1].clef, "G2(-1o)")
+        # First note: written C#5 (MIDI 73) transposed by -14 -> sounding MIDI 59; dotted quarter = 3/8
+        n0 = m0.notes[0]
+        self.assertEqual((n0.step, n0.alter, n0.octave), ("C", 1, 5))
+        self.assertEqual(n0.midi, 59)
+        self.assertEqual(n0.duration, Fraction(3, 8))
+        self.assertTrue(n0.tie_start and n0.tie_stop)
+        # Second note: unpitched E4
+        self.assertEqual((m0.notes[1].step, m0.notes[1].octave), ("E", 4))
+        # Rest has fermata articulation
+        self.assertEqual(m0.rests[0].articulations, ("fermata",))
+
+        # 2. <score-timewise> equals <score-partwise>
+        tw_xml = (
+            '<?xml version="1.0"?><score-timewise><measure number="1">'
+            '<part id="P1"><attributes><divisions>1</divisions>'
+            "<time><beats>4</beats><beat-type>4</beat-type></time></attributes>"
+            + _note_xml("C", 4, 4)
+            + "</part></measure></score-timewise>"
+        )
+        pw_xml = _wrap_partwise(
+            '<measure number="1"><attributes><divisions>1</divisions>'
+            "<time><beats>4</beats><beat-type>4</beat-type></time></attributes>"
+            + _note_xml("C", 4, 4) + "</measure>"
+        )
+        res_tw = align_and_score_cer(parse_musicxml(tw_xml), parse_musicxml(pw_xml))
+        self.assertAlmostEqual(res_tw.f1_t1c, 1.0)
+
+        # 3. parse_musicxml_file supports .mxl ZIP containers
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mxl_path = Path(tmpdir) / "sample.mxl"
+            container_xml = (
+                '<?xml version="1.0"?><container><rootfiles>'
+                '<rootfile full-path="score.musicxml"/>'
+                "</rootfiles></container>"
+            )
+            with zipfile.ZipFile(mxl_path, "w") as zf:
+                zf.writestr("META-INF/container.xml", container_xml)
+                zf.writestr("score.musicxml", pw_xml)
+            mxl_score = parse_musicxml_file(mxl_path)
+            self.assertEqual(mxl_score.total_notes, 1)
+
+        # 4. Cross-measure wedges, octave-shift continue, NFC words, metronome beat-unit, harmony root-alter=0, no spurious ctx
+        xml_expr = _wrap_partwise(
+            '<measure number="1">'
+            "<attributes><divisions>1</divisions><staves>2</staves>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            '<clef number="1"><sign>G</sign><line>2</line></clef></attributes>'
+            '<attributes><clef number="2"><sign>G</sign><line>2</line></clef></attributes>'
+            '<direction><direction-type><wedge type="crescendo" number="1"/></direction-type><staff>1</staff></direction>'
+            '<direction><direction-type><octave-shift type="down" size="8"/></direction-type><staff>1</staff></direction>'
+            '<direction><direction-type><words>Cafe\u0301</words></direction-type><staff>1</staff></direction>'
+            '<direction><direction-type><metronome><beat-unit>quarter</beat-unit><per-minute>120</per-minute></metronome></direction-type><staff>1</staff></direction>'
+            "<harmony><root><root-step>C</root-step><root-alter>0</root-alter></root><kind>major</kind><staff>1</staff></harmony>"
+            + _note_xml("C", 5, 4, voice="1", staff=1)
+            + "<backup><duration>4</duration></backup>"
+            + _note_xml("C", 4, 4, voice="2", staff=2)
+            + "</measure>"
+            + '<measure number="2">'
+            + '<direction><direction-type><octave-shift type="continue" size="8"/></direction-type><staff>1</staff></direction>'
+            + _note_xml("D", 5, 4, voice="1", staff=1)
+            + '<direction><direction-type><wedge type="stop" number="1"/></direction-type><staff>1</staff></direction>'
+            + "<backup><duration>4</duration></backup>"
+            + _note_xml("D", 4, 4, voice="2", staff=2)
+            + "</measure>"
+        )
+        sc_expr = parse_musicxml(xml_expr)
+        # Staff 2 m0 must NOT emit spurious clef change despite second <attributes> block
+        self.assertEqual(sc_expr.measures[2].context_changes, ())
+        # Measure 2 staff 1 keeps ottava=1 across <octave-shift type="continue"/>
+        self.assertEqual(sc_expr.measures[1].note_contexts[0].ottava, 1)
+        # Wedge carried across m1->m2 emits 1 wedge on m1, 0 on m2
+        wedges_m1 = [d for d in sc_expr.measures[0].directions if d.kind == "wedge"]
+        wedges_m2 = [d for d in sc_expr.measures[1].directions if d.kind == "wedge"]
+        self.assertEqual(len(wedges_m1), 1)
+        self.assertEqual(len(wedges_m2), 0)
+        # NFC words, metronome beat-unit, and root-alter=0 normalization
+        dir_map = {(d.kind, d.value) for d in sc_expr.measures[0].directions}
+        self.assertIn(("words", "Caf\u00e9"), dir_map)
+        self.assertIn(("tempo", "quarter=120"), dir_map)
+        self.assertIn(("harmony", "C:major"), dir_map)
+
+    def test_context_drift_taxonomy_negative_page_and_type_error_handling(self) -> None:
+        """Clef mismatch populates global_context_drift_pct even with 0 pitch matches; TypeError caught."""
+        gt_xml = _wrap_partwise(
+            '<measure number="1"><attributes><divisions>1</divisions>'
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            + _note_xml("C", 5, 4) + "</measure>"
+        )
+        wrong_clef_xml = _wrap_partwise(
+            '<measure number="1"><attributes><divisions>1</divisions>'
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>F</sign><line>4</line></clef></attributes>"
+            + _note_xml("E", 3, 4) + "</measure>"
+        )
+        res_ctx = align_and_score_cer(parse_musicxml(wrong_clef_xml), parse_musicxml(gt_xml))
+        self.assertGreater(res_ctx.error_buckets["global_context_drift_pct"], 0.0)
+
+        # Negative/empty GT page with hallucinated pred notes -> 100% hallucination_truncation_pct
+        empty_gt = parse_musicxml(
+            _wrap_partwise(
+                '<measure number="1"><attributes><divisions>1</divisions>'
+                "<time><beats>4</beats><beat-type>4</beat-type></time></attributes></measure>"
+            )
+        )
+        halluc_pred = parse_musicxml(gt_xml)
+        res_neg = align_and_score_cer(halluc_pred, empty_gt)
+        self.assertAlmostEqual(res_neg.error_buckets["hallucination_truncation_pct"], 100.0)
+        self.assertAlmostEqual(res_neg.error_buckets["pitch_accidental_pct"], 0.0)
+
+        # None pred_xml caught cleanly via TypeError
+        pm_none = score_musicxml_pair(
+            None,  # type: ignore[arg-type]
+            gt_xml,
+            page_id="p_none",
+            work_id="w_none",
+            domain="CDR",
+        )
+        self.assertFalse(pm_none.parseable)
 
 
 if __name__ == "__main__":

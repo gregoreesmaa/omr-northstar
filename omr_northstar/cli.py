@@ -14,6 +14,7 @@ from .validate import (
     PERMISSIVE_LICENSES,
     REQUIRED_PAGE_FIELDS,
     VALID_VISUAL_TIERS,
+    _is_valid_split,
     validate_disjoint_splits,
     validate_manifest,
     validate_page_records,
@@ -90,22 +91,33 @@ def format_scorecard(report: dict[str, Any]) -> str:
 
 def _cmd_score(args: argparse.Namespace) -> int:
     src = pathlib.Path(args.results_json)
-    payload = json.loads(src.read_text(encoding="utf-8"))
+    payload = json.loads(src.read_text(encoding="utf-8-sig"))
     if isinstance(payload, list):
         raw_pages = payload
         system_name = args.system_name or src.stem
-        split = args.split
+        split = args.split if args.split is not None else "dev-v1"
         adversarial = None
         telemetry = None
     elif isinstance(payload, dict) and "pages" in payload:
         raw_pages = payload["pages"]
         system_name = args.system_name or str(payload.get("system_name", src.stem))
-        split = str(payload.get("split", args.split))
+        split = (
+            args.split
+            if args.split is not None
+            else str(payload.get("split", "dev-v1"))
+        )
         adversarial = payload.get("adversarial_scorecard")
         telemetry = payload.get("efficiency_telemetry")
     else:
         print(
             "Error: input JSON must be a list of page objects or an object with a 'pages' key.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not _is_valid_split(split):
+        print(
+            f"Error: invalid split {split!r}. Expected 'dev-v1', 'test-v1', 'fresh', or 'fresh-YYYY'.",
             file=sys.stderr,
         )
         return 1
@@ -140,13 +152,14 @@ def _cmd_score(args: argparse.Namespace) -> int:
 
     if args.json_out:
         out_path = pathlib.Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    rep_a = json.loads(pathlib.Path(args.report_a).read_text(encoding="utf-8"))
-    rep_b = json.loads(pathlib.Path(args.report_b).read_text(encoding="utf-8"))
+    rep_a = json.loads(pathlib.Path(args.report_a).read_text(encoding="utf-8-sig"))
+    rep_b = json.loads(pathlib.Path(args.report_b).read_text(encoding="utf-8-sig"))
     diff = compare_reports(
         rep_a,
         rep_b,
@@ -157,13 +170,14 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     print(format_comparison(diff))
     if args.json_out:
         out_path = pathlib.Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(diff, indent=2) + "\n", encoding="utf-8")
     return 0 if diff["passed"] else 1
 
 
 def _cmd_validate_manifest(args: argparse.Namespace) -> int:
     src = pathlib.Path(args.manifest_json)
-    payload = json.loads(src.read_text(encoding="utf-8"))
+    payload = json.loads(src.read_text(encoding="utf-8-sig"))
     errors = validate_manifest(payload, allow_legacy_pd=args.allow_legacy_pd)
     if errors:
         for err in errors:
@@ -175,8 +189,8 @@ def _cmd_validate_manifest(args: argparse.Namespace) -> int:
 
 
 def _cmd_validate_splits(args: argparse.Namespace) -> int:
-    dev = json.loads(pathlib.Path(args.dev_manifest).read_text(encoding="utf-8"))
-    test = json.loads(pathlib.Path(args.test_manifest).read_text(encoding="utf-8"))
+    dev = json.loads(pathlib.Path(args.dev_manifest).read_text(encoding="utf-8-sig"))
+    test = json.loads(pathlib.Path(args.test_manifest).read_text(encoding="utf-8-sig"))
     errors: list[str] = []
     errors.extend(f"[dev] {e}" for e in validate_manifest(dev, allow_legacy_pd=args.allow_legacy_pd))
     errors.extend(f"[test] {e}" for e in validate_manifest(test, allow_legacy_pd=args.allow_legacy_pd))
@@ -193,7 +207,7 @@ def _cmd_validate_splits(args: argparse.Namespace) -> int:
 
 def _cmd_validate_report(args: argparse.Namespace) -> int:
     src = pathlib.Path(args.report_json)
-    payload = json.loads(src.read_text(encoding="utf-8"))
+    payload = json.loads(src.read_text(encoding="utf-8-sig"))
     errors = validate_report(payload)
     if errors:
         for err in errors:
@@ -216,7 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_score = sub.add_parser("score", help="Score a page-level results JSON file.")
     p_score.add_argument("results_json", help="Path to page-level results JSON.")
     p_score.add_argument("--system-name", default=None, help="Override system name.")
-    p_score.add_argument("--split", default="dev-v1", help="Benchmark split (dev-v1, test-v1, fresh-YYYY).")
+    p_score.add_argument("--split", default=None, help="Benchmark split (dev-v1, test-v1, fresh-YYYY).")
     p_score.add_argument("--json-out", default=None, help="Write canonical report.json to path.")
     p_score.add_argument(
         "--include-per-page",
@@ -261,7 +275,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_rep.set_defaults(func=_cmd_validate_report)
 
     parsed = parser.parse_args(argv)
-    return int(parsed.func(parsed))
+    try:
+        return int(parsed.func(parsed))
+    except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

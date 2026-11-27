@@ -229,6 +229,7 @@ Every page is classified along **three independent axes** so difficulty never hi
 | [`docs/04-metrics-and-human-utility.md`](docs/04-metrics-and-human-utility.md) | CER alignment, 4-axis scoring, `wFPP` / `NTSR` / `CFR`, `NC-Gate`, `NS` & `NS_tier` |
 | [`docs/05-adversarial-stress-tests.md`](docs/05-adversarial-stress-tests.md) | All 9 adversarial stress-test families & Parametric Trap Generator protocol |
 | [`docs/06-submission-and-harness.md`](docs/06-submission-and-harness.md) | Sealed `test-v1` Docker container contract, network isolation, timeouts, CLI workflow |
+| [`schemas/manifest.schema.json`](schemas/manifest.schema.json) | Draft 2020-12 JSON Schema for full split manifest envelopes (`dev-v1`, `test-v1`, `fresh-YYYY`) |
 | [`schemas/page_metadata.schema.json`](schemas/page_metadata.schema.json) | Draft 2020-12 JSON Schema for per-page metadata, provenance, and pairing |
 | [`schemas/report.schema.json`](schemas/report.schema.json) | Draft 2020-12 JSON Schema for the canonical 4-layer `report.json` output |
 

@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from typing import Any
 
+import omr_northstar
 from omr_northstar.cli import main as cli_main
-from omr_northstar.compare import compare_reports, format_comparison
+from omr_northstar.compare import _paired_permutation_pvalue, compare_reports, format_comparison
 from omr_northstar.scoring import DOMAINS, PageMetrics, build_report, compute_page_quality
 from omr_northstar.validate import (
     NC_EVAL_ONLY_LICENSES,
     PERMISSIVE_LICENSES,
     validate_disjoint_splits,
     validate_manifest,
+    validate_page_records,
     validate_report,
 )
 
@@ -166,13 +172,49 @@ class TestSchemas(unittest.TestCase):
         self.assertIn("stress_tests", data["properties"])
         self.assertIn("stress_tests", data["properties"]["layer2_matrix_and_deltas"]["properties"])
         self.assertIn("per_page_scores", data["properties"]["layer4_forensic_pack"]["properties"])
+        self.assertIn("nc_gate", data["properties"])
+        self.assertNotIn("nc_gate", data["properties"]["layer2_matrix_and_deltas"]["properties"])
+        pd_props = data["properties"]["layer2_matrix_and_deltas"]["properties"]["paired_deltas"]["properties"]
+        self.assertEqual(pd_props["delta_engraver"]["minimum"], 0)
+        self.assertEqual(pd_props["delta_engraver"]["maximum"], 100)
+        self.assertEqual(pd_props["delta_photo"]["minimum"], -100)
+        self.assertEqual(pd_props["delta_photo"]["maximum"], 100)
+        self.assertEqual(pd_props["delta_handwriting"]["minimum"], -100)
+        self.assertEqual(pd_props["delta_handwriting"]["maximum"], 100)
 
     def test_manifest_schema_envelope_and_tracks(self) -> None:
         data = json.loads((REPO_ROOT / "schemas" / "manifest.schema.json").read_text(encoding="utf-8"))
         props = data["properties"]
-        for key in ("schema_version", "benchmark_version", "split", "canary", "track", "eval_only", "pages"):
+        for key in (
+            "schema_version",
+            "manifest_version",
+            "benchmark_version",
+            "split",
+            "canary",
+            "track",
+            "eval_only",
+            "license",
+            "ground_truth_files",
+            "pages",
+        ):
             self.assertIn(key, props)
         self.assertEqual(props["pages"]["items"]["$ref"], "page_metadata.schema.json")
+        # Pilot manifest top-level keys are all allowed under additionalProperties: false
+        pilot_path = REPO_ROOT / "pilot_dev_v0_1" / "manifest.json"
+        if pilot_path.exists():
+            pilot = json.loads(pilot_path.read_text(encoding="utf-8"))
+            self.assertTrue(set(pilot.keys()).issubset(set(props.keys())))
+
+    def test_page_metadata_schema_requires_staff_space_on_music_pages(self) -> None:
+        data = json.loads((REPO_ROOT / "schemas" / "page_metadata.schema.json").read_text(encoding="utf-8"))
+        all_of = data.get("allOf", [])
+        self.assertTrue(
+            any(
+                isinstance(rule, dict)
+                and rule.get("else", {}).get("required") == ["staff_space_px"]
+                for rule in all_of
+            )
+        )
 
 
 class TestGovernanceValidators(unittest.TestCase):
@@ -330,6 +372,164 @@ class TestGovernanceValidators(unittest.TestCase):
         self.assertTrue(any("ns_score" in e for e in errs))
         self.assertTrue(any("ns_ci95" in e for e in errs))
 
+    def test_validate_rejects_null_subobjects_unhashable_nan_and_bypasses(self) -> None:
+        # Null / wrong-type page sub-objects must NOT silently bypass
+        for field in ("geometry", "photometry", "optics_codec", "provenance", "license"):
+            rec = _make_page_record(**{field: None})
+            errs = validate_page_records([rec])
+            self.assertTrue(any(f"{field} must be an object" in e for e in errs), (field, errs))
+
+        # Unhashable list/dict values must NOT raise TypeError
+        unhashable_rec = _make_page_record(
+            domain=["RWP"],
+            complexity_tier={"t": "T2"},
+            visual_tier=["M"],
+            visual_severity=["V2"],
+            repertoire_stratum=["T2.1"],
+            paired_protocol=["A"],
+            track=["core_permissive"],
+            stress_test_families=[["1A"], "9Z"],
+        )
+        unhashable_rec["optics_codec"]["bit_depth"] = [24]
+        unhashable_rec["optics_codec"]["codec"] = ""
+        unhashable_rec["provenance"]["gt_verification"] = ["born_digital_canonical"]
+        unhashable_rec["provenance"]["source_type"] = "   "
+        unhashable_rec["license"]["music_license"] = ["CC0-1.0"]
+        unhashable_rec["license"]["image_license"] = {"lic": "CC0-1.0"}
+        errs = validate_page_records([unhashable_rec])
+        self.assertTrue(any("invalid domain" in e for e in errs))
+        self.assertTrue(any("bit_depth" in e for e in errs))
+        self.assertTrue(any("optics_codec.codec" in e for e in errs))
+        self.assertTrue(any("provenance.source_type" in e for e in errs))
+        self.assertTrue(any("stress_test_families" in e for e in errs))
+
+        # Non-finite NaN / Inf numbers must be rejected
+        nan_rec = _make_page_record()
+        nan_rec["geometry"]["rotation_deg"] = float("nan")
+        nan_rec["photometry"]["illumination_gradient_ev"] = float("inf")
+        nan_rec["staff_space_px"]["median"] = float("nan")
+        errs_nan = validate_page_records([nan_rec])
+        self.assertTrue(any("rotation_deg" in e for e in errs_nan))
+        self.assertTrue(any("illumination_gradient_ev" in e for e in errs_nan))
+        self.assertTrue(any("staff_space_px.median" in e for e in errs_nan))
+
+        # Null bypasses on staff_space_px (non-NC), strict bool on is_negative_control & eval_only
+        null_ss = _make_page_record(staff_space_px=None, is_negative_control=False)
+        self.assertTrue(any("staff_space_px" in e for e in validate_page_records([null_ss])))
+        bad_bools = _make_page_record(is_negative_control="true", eval_only=1)
+        errs_bools = validate_page_records([bad_bools])
+        self.assertTrue(any("is_negative_control must be boolean" in e for e in errs_bools))
+        self.assertTrue(any("eval_only must be boolean" in e for e in errs_bools))
+
+        # Null bypasses on manifest schema_version, split, and empty benchmark_version
+        bad_m = _make_manifest([_make_page_record()], schema_version=None, split=None, benchmark_version="")
+        errs_m = validate_manifest(bad_m)
+        self.assertTrue(any("schema_version" in e for e in errs_m))
+        self.assertTrue(any("invalid split" in e for e in errs_m))
+        self.assertTrue(any("benchmark_version" in e for e in errs_m))
+
+        # Null/wrong-type report layers, ns_ci95 out of [0, 100], layer3 sum != 100%, NaN
+        pages = [
+            PageMetrics(f"p_{d}", f"w_{d}", d, "T2", 0.9, 0.9, 0.9, 0.9, 10.0, 100.0)
+            for d in DOMAINS
+        ]
+        rep = build_report(pages, system_name="sys-a", split="dev-v1")
+        for layer in (
+            "layer1_headline",
+            "layer2_matrix_and_deltas",
+            "layer3_error_taxonomy",
+            "layer4_forensic_pack",
+        ):
+            bad_r = json.loads(json.dumps(rep))
+            bad_r[layer] = None
+            errs_r = validate_report(bad_r)
+            self.assertTrue(any(f"{layer} must be an object" in e for e in errs_r), (layer, errs_r))
+
+        bad_r2 = json.loads(json.dumps(rep))
+        bad_r2["schema_version"] = None
+        bad_r2["benchmark_version"] = " "
+        bad_r2["layer1_headline"]["ns_ci95"] = [-5.0, 105.0]
+        bad_r2["layer1_headline"]["m_geom"] = float("nan")
+        bad_r2["layer3_error_taxonomy"]["pitch_accidental_pct"] = 40.0
+        bad_r2["layer3_error_taxonomy"]["rhythm_meter_pct"] = 20.0
+        errs_r2 = validate_report(bad_r2)
+        self.assertTrue(any("schema_version" in e for e in errs_r2))
+        self.assertTrue(any("benchmark_version" in e for e in errs_r2))
+        self.assertTrue(any("ns_ci95" in e for e in errs_r2))
+        self.assertTrue(any("m_geom" in e for e in errs_r2))
+        self.assertTrue(any("sum to 100%" in e for e in errs_r2))
+
+    def test_disjoint_splits_rwp_unseen_capture_device_check(self) -> None:
+        dev = _make_manifest(
+            [
+                _make_page_record(
+                    page_id="d1",
+                    work_id="w_d1",
+                    split="dev-v1",
+                    domain="RWP",
+                    provenance={
+                        "source_type": "in_house_phone",
+                        "capture_device_id": "phone-A",
+                        "gt_verification": "double_blind_human_adjudicated",
+                    },
+                ),
+                _make_page_record(
+                    page_id="d2",
+                    work_id="w_d2",
+                    split="dev-v1",
+                    domain="RWP",
+                    provenance={
+                        "source_type": "in_house_phone",
+                        "capture_device_id": "phone-B",
+                        "gt_verification": "double_blind_human_adjudicated",
+                    },
+                ),
+            ],
+            split="dev-v1",
+        )
+        # Only 1 of 3 test devices unseen (33.3% < 50%) -> FAIL
+        test_fail = _make_manifest(
+            [
+                _make_page_record(
+                    page_id=f"t{i}",
+                    work_id=f"w_t{i}",
+                    split="test-v1",
+                    domain="RWP",
+                    provenance={
+                        "source_type": "in_house_phone",
+                        "capture_device_id": dev_id,
+                        "gt_verification": "double_blind_human_adjudicated",
+                    },
+                )
+                for i, dev_id in enumerate(["phone-A", "phone-B", "phone-C"])
+            ],
+            split="test-v1",
+            canary=None,
+        )
+        errs_fail = validate_disjoint_splits(dev, test_fail)
+        self.assertTrue(any("capture_device_id" in e for e in errs_fail), errs_fail)
+
+        # 1 of 2 test devices unseen (50.0% >= 50%) -> PASS
+        test_ok = _make_manifest(
+            [
+                _make_page_record(
+                    page_id=f"t{i}",
+                    work_id=f"w_t{i}",
+                    split="test-v1",
+                    domain="RWP",
+                    provenance={
+                        "source_type": "in_house_phone",
+                        "capture_device_id": dev_id,
+                        "gt_verification": "double_blind_human_adjudicated",
+                    },
+                )
+                for i, dev_id in enumerate(["phone-A", "phone-C"])
+            ],
+            split="test-v1",
+            canary=None,
+        )
+        self.assertEqual(validate_disjoint_splits(dev, test_ok), [])
+
 
 class TestCompareReports(unittest.TestCase):
     """Verify Layer 4 compare(A, B) paired permutation regression detection."""
@@ -397,6 +597,87 @@ class TestCompareReports(unittest.TestCase):
         self.assertTrue(diff["passed"])
         self.assertEqual(diff["regressions"], [])
         self.assertGreater(diff["headline"]["ns_delta"], 0.0)
+
+    def test_work_clustered_permutation_prevents_pseudo_replication(self) -> None:
+        # 8 pages in HWM all belonging to a SINGLE work_id:
+        # Page-level permutation would yield p < 0.01, but work-clustered permutation
+        # has n_clusters = 1, so two-sided p >= 0.5 (cannot be < 0.05).
+        dom_a = {d: [(f"{d}_{i}", "T1", 0.80) for i in range(8)] for d in DOMAINS}
+        dom_b = {
+            "CDR": [(f"CDR_{i}", "T1", 0.90) for i in range(8)],
+            "ALS": [(f"ALS_{i}", "T1", 0.90) for i in range(8)],
+            "RWP": [(f"RWP_{i}", "T1", 0.90) for i in range(8)],
+            "HWM": [(f"HWM_{i}", "T1", 0.70) for i in range(8)],
+        }
+        rep_a = _make_report_with_pages("baseline", dom_a)
+        rep_b = _make_report_with_pages("candidate", dom_b)
+        for rep in (rep_a, rep_b):
+            for p in rep["layer4_forensic_pack"]["per_page_scores"]:
+                if p["domain"] == "HWM":
+                    p["work_id"] = "single_shared_work"
+        diff = compare_reports(rep_a, rep_b, n_perm=500, seed=42)
+        self.assertGreaterEqual(diff["domain_deltas"]["HWM"]["p_value"], 0.4)
+        self.assertFalse(diff["domain_deltas"]["HWM"]["significant"])
+        self.assertEqual(diff["regressions"], [])
+
+    def test_compare_guards_sign_inversion_nan_params_and_tier_fallback(self) -> None:
+        # 1. NaN/Inf diffs raise ValueError
+        with self.assertRaises(ValueError):
+            _paired_permutation_pvalue([1.0, float("nan")], n_perm=100)
+        with self.assertRaises(ValueError):
+            _paired_permutation_pvalue([1.0, float("inf")], n_perm=100)
+
+        # 2. Invalid alpha / n_perm / unpaired_drop_threshold raise ValueError
+        dom = {d: [(f"{d}_0", "T1", 0.85)] for d in DOMAINS}
+        rep_a = _make_report_with_pages("a", dom)
+        rep_b = _make_report_with_pages("b", dom)
+        with self.assertRaises(ValueError):
+            compare_reports(rep_a, rep_b, alpha=0.0)
+        with self.assertRaises(ValueError):
+            compare_reports(rep_a, rep_b, alpha=1.0)
+        with self.assertRaises(ValueError):
+            compare_reports(rep_a, rep_b, n_perm=0)
+        with self.assertRaises(ValueError):
+            compare_reports(rep_a, rep_b, unpaired_drop_threshold=-1.0)
+
+        # 3. Sign-inversion guard: if stratum_scores drop (<0) but paired diffs are positive (>0),
+        # must NOT flag a significant regression.
+        dom_pos_a = {d: [(f"{d}_{i}", "T1", 0.70) for i in range(8)] for d in DOMAINS}
+        dom_pos_b = {d: [(f"{d}_{i}", "T1", 0.90) for i in range(8)] for d in DOMAINS}
+        ra_inv = _make_report_with_pages("a", dom_pos_a)
+        rb_inv = _make_report_with_pages("b", dom_pos_b)
+        rb_inv["layer1_headline"]["stratum_scores"]["CDR"] = (
+            ra_inv["layer1_headline"]["stratum_scores"]["CDR"] - 5.0
+        )
+        diff_inv = compare_reports(ra_inv, rb_inv, n_perm=500, seed=42)
+        self.assertFalse(
+            any(r["scope"] == "domain" and r["key"] == "CDR" for r in diff_inv["regressions"])
+        )
+
+        # 4. tier_deltas fallback when matrix is absent & tier mismatches exist (never > 100.0)
+        ra_tier = _make_report_with_pages("a", dom_pos_a)
+        rb_tier = _make_report_with_pages("b", dom_pos_b)
+        ra_tier["layer2_matrix_and_deltas"]["tier_domain_matrix"] = {}
+        rb_tier["layer2_matrix_and_deltas"]["tier_domain_matrix"] = {}
+        rb_tier["layer4_forensic_pack"]["per_page_scores"][0]["tier"] = "T2"
+        diff_tier = compare_reports(ra_tier, rb_tier, n_perm=200, seed=42)
+        self.assertLessEqual(diff_tier["tier_deltas"]["T1"]["score_a"], 100.0)
+        self.assertLessEqual(diff_tier["tier_deltas"]["T1"]["score_b"], 100.0)
+
+        # 5. n_only_a, n_only_b, split_mismatch recorded
+        ra_m = _make_report_with_pages("a", dom)
+        rb_m = _make_report_with_pages("b", dom)
+        rb_m["split"] = "test-v1"
+        ra_m["layer4_forensic_pack"]["per_page_scores"].append(
+            {"page_id": "only_a", "work_id": "wa", "domain": "CDR", "tier": "T1", "q_score": 80.0}
+        )
+        rb_m["layer4_forensic_pack"]["per_page_scores"].append(
+            {"page_id": "only_b", "work_id": "wb", "domain": "CDR", "tier": "T1", "q_score": 85.0}
+        )
+        diff_m = compare_reports(ra_m, rb_m, n_perm=100, seed=42)
+        self.assertEqual(diff_m["n_only_a"], 1)
+        self.assertEqual(diff_m["n_only_b"], 1)
+        self.assertTrue(diff_m["split_mismatch"])
 
 
 class TestCLISubcommands(unittest.TestCase):
@@ -470,6 +751,74 @@ class TestCLISubcommands(unittest.TestCase):
             self.assertEqual(cli_main(["validate-manifest", str(dev_m)]), 0)
             self.assertEqual(cli_main(["validate-manifest", str(bad_m)]), 1)
             self.assertEqual(cli_main(["validate-splits", str(dev_m), str(test_m)]), 0)
+
+    def test_cli_split_override_bom_mkdir_errors_cp1252_and_exports(self) -> None:
+        # Top-level package re-exports
+        for sym in (
+            "compare_reports",
+            "format_comparison",
+            "validate_manifest",
+            "validate_page_records",
+            "validate_disjoint_splits",
+            "validate_report",
+        ):
+            self.assertTrue(hasattr(omr_northstar, sym), f"Missing export: {sym}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pages = [
+                {
+                    "page_id": f"{d}_0",
+                    "work_id": f"w_{d}_0",
+                    "domain": d,
+                    "tier": "T2",
+                    "s_note": 0.85,
+                    "s_struct": 0.85,
+                    "s_expr": 0.85,
+                    "s_play": 0.85,
+                    "wfpp": 15.0,
+                    "transcribe_cost": 100.0,
+                }
+                for d in DOMAINS
+            ]
+            # Write UTF-8 with BOM to verify utf-8-sig reading
+            res_bom = root / "res_bom.json"
+            res_bom.write_bytes(
+                b"\xef\xbb\xbf"
+                + json.dumps({"system_name": "sys-bom", "split": "dev-v1", "pages": pages}).encode("utf-8")
+            )
+            nested_out = root / "nested" / "dir" / "rep.json"
+
+            # --split test-v1 must override "split": "dev-v1" in dict payload
+            rc = cli_main(["score", str(res_bom), "--split", "test-v1", "--include-per-page", "--json-out", str(nested_out)])
+            self.assertEqual(rc, 0)
+            self.assertTrue(nested_out.exists())
+            rep_data = json.loads(nested_out.read_text(encoding="utf-8"))
+            self.assertEqual(rep_data["split"], "test-v1")
+
+            # Invalid --split returns exit code 1 cleanly
+            self.assertEqual(cli_main(["score", str(res_bom), "--split", "not-a-split"]), 1)
+
+            # Missing file & malformed JSON return exit code 1 cleanly (no traceback)
+            self.assertEqual(cli_main(["score", str(root / "missing.json")]), 1)
+            bad_json = root / "bad.json"
+            bad_json.write_text("{not valid json", encoding="utf-8")
+            self.assertEqual(cli_main(["validate-report", str(bad_json)]), 1)
+
+            # Windows cp1252 subprocess check for `compare` output
+            env = dict(os.environ)
+            env["PYTHONIOENCODING"] = "cp1252"
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            proc = subprocess.run(
+                [sys.executable, "-m", "omr_northstar", "compare", str(nested_out), str(nested_out)],
+                cwd=str(REPO_ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="cp1252",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("M_geom Delta:", proc.stdout)
 
 
 if __name__ == "__main__":
