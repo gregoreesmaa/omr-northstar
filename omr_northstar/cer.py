@@ -403,9 +403,20 @@ def _split_multistaff_part(
             ]
 
             # Credit cross-staff voice events from sibling staves via synthetic CERForward
+            # ONLY when the voice on staff `s` is genuinely incomplete (own_sum < expected)
+            # and sibling-staff non-overlapping slots complete it without exceeding expected.
+            s_ctx = m.contexts.get(s) or next(iter(m.contexts.values()), CERContext())
+            expected_dur = Fraction(s_ctx.time_num, s_ctx.time_den)
             active_voices = {n.voice for n in s_notes} | {r.voice for r in s_rests}
             slots = measure_voice_staff_slots[m_i]
             for v in sorted(active_voices):
+                own_sum = (
+                    sum((n.duration for n in s_notes if n.voice == v and not n.grace and not n.is_chord), Fraction(0))
+                    + sum((r.duration for r in s_rests if r.voice == v), Fraction(0))
+                    + sum((f.duration for f in s_forwards_list if f.voice == v), Fraction(0))
+                )
+                if own_sum >= expected_dur:
+                    continue
                 own_onsets = (
                     {n.onset for n in s_notes if n.voice == v and not n.grace}
                     | {r.onset for r in s_rests if r.voice == v}
@@ -419,15 +430,17 @@ def _split_multistaff_part(
                         if sib_on not in own_onsets:
                             if sib_on not in sib_onsets or sib_dur > sib_onsets[sib_on]:
                                 sib_onsets[sib_on] = sib_dur
-                for sib_on in sorted(sib_onsets):
-                    s_forwards_list.append(
-                        CERForward(
-                            staff=1,
-                            voice=v,
-                            onset=sib_on,
-                            duration=sib_onsets[sib_on],
+                sib_total = sum(sib_onsets.values(), Fraction(0))
+                if sib_total > 0 and own_sum + sib_total <= expected_dur + Fraction(1, 32):
+                    for sib_on in sorted(sib_onsets):
+                        s_forwards_list.append(
+                            CERForward(
+                                staff=1,
+                                voice=v,
+                                onset=sib_on,
+                                duration=sib_onsets[sib_on],
+                            )
                         )
-                    )
 
             s_dirs = tuple(replace(d, staff=1) for d in m.directions if d.staff == s)
             s_ctx_changes = tuple(
@@ -435,7 +448,6 @@ def _split_multistaff_part(
                 for c_staff, c_onset, c_kind, c_val in m.context_changes
                 if c_staff == 0 or c_staff == s
             )
-            s_ctx = m.contexts.get(s) or next(iter(m.contexts.values()), CERContext())
             split_measures.append(
                 CERMeasure(
                     part_id=s_part_id,
@@ -1463,7 +1475,10 @@ def _compute_bsvr(measures: Sequence[CERMeasure]) -> float:
     return valid / total
 
 
-def _extract_sounding_events(score: CERScore) -> Counter[Hashable]:
+def _extract_sounding_events(
+    score: CERScore,
+    forced_measure_lens: Mapping[tuple[str, int], Fraction] | None = None,
+) -> Counter[Hashable]:
     """Resolve ties and unroll measure onsets into sounding MIDI events.
 
     - Uses actual duration for implicit/senza-misura/partial measures.
@@ -1523,6 +1538,8 @@ def _extract_sounding_events(score: CERScore) -> Counter[Hashable]:
             and Fraction(0) < act_len < nom_len
         )
         m_len = act_len if (is_partial_bar and act_len > 0) else nom_len
+        if forced_measure_lens is not None and (m.part_id, m.index) in forced_measure_lens:
+            m_len = forced_measure_lens[(m.part_id, m.index)]
 
         for n in m.notes:
             if n.grace:
@@ -2254,8 +2271,45 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
         else 1.0
     )
 
-    # S_play: unrolled sounding MIDI-event F1 (resolving ties)
-    play_pred = _extract_sounding_events(pred)
+    # S_play: unrolled sounding MIDI-event F1 (resolving ties).
+    # For Bucket-A parity on GT-implicit/partial pickup bars where a prediction
+    # pads the pickup bar with trailing rests to full nominal length, align the
+    # predicted bar's unrolled length to the GT partial bar length when all
+    # predicted notes finish within the GT partial bar duration.
+    gt_max_idx_by_base: dict[str, int] = defaultdict(int)
+    for mg in gt_eff.measures:
+        bpid = _base_part_id(mg.part_id)
+        if mg.index > gt_max_idx_by_base[bpid]:
+            gt_max_idx_by_base[bpid] = mg.index
+    forced_pred_lens: dict[tuple[str, int], Fraction] = {}
+    for p_i, g_i in alignment:
+        if p_i is None or g_i is None:
+            continue
+        mp = pred.measures[p_i]
+        mg = gt_eff.measures[g_i]
+        g_ctx = next(iter(mg.contexts.values()), CERContext())
+        g_nom = Fraction(g_ctx.time_num, g_ctx.time_den)
+        g_act = max(
+            [n.onset + n.duration for n in mg.notes if not n.grace]
+            + [r.onset + r.duration for r in mg.rests]
+            + [f.onset + f.duration for f in mg.forwards],
+            default=Fraction(0),
+        )
+        g_bpid = _base_part_id(mg.part_id)
+        g_is_partial = (mg.is_implicit or mg.is_senza_misura) or (
+            gt_max_idx_by_base[g_bpid] >= 1
+            and mg.index in (0, gt_max_idx_by_base[g_bpid])
+            and Fraction(0) < g_act < g_nom
+        )
+        if g_is_partial and Fraction(0) < g_act < g_nom:
+            p_note_end = max(
+                (n.onset + n.duration for n in mp.notes if not n.grace),
+                default=Fraction(0),
+            )
+            if p_note_end <= g_act:
+                forced_pred_lens[(mp.part_id, mp.index)] = g_act
+
+    play_pred = _extract_sounding_events(pred, forced_measure_lens=forced_pred_lens or None)
     play_gt = _extract_sounding_events(gt_eff)
     play_matched = _multiset_intersection_size(play_pred, play_gt)
     s_play = _f1_from_counts(play_matched, sum(play_pred.values()), sum(play_gt.values()))
