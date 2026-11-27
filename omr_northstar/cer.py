@@ -40,6 +40,43 @@ BAR_STYLE_MAP: dict[str, str] = {
     "none": "regular",
 }
 
+# Standard musical rational denominators (whole-note units) up to 192:
+# binary subdivisions (1..128), triplets/sextuplets/nontuplets (3..192),
+# quintuplets (5..160), septuplets (7..112), and compound tuplets (15..120).
+_MUSICAL_DENOMINATORS: tuple[int, ...] = (
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 16, 18, 20, 24,
+    28, 30, 32, 36, 40, 48, 56, 60, 64, 72, 80, 96, 112, 120, 128, 144, 160, 192,
+)
+_SNAP_MAX_DENOM: int = 192
+_SNAP_TIGHT_TOL: Fraction = Fraction(1, 10000)
+_SNAP_TOL: Fraction = Fraction(1, 1000)
+
+
+def _snap_rational(val: Fraction, tol: Fraction = _SNAP_TOL) -> Fraction:
+    """Snap MusicXML <divisions> rounding residuals to exact musical rationals.
+
+    Values already on the denominator <= 192 grid (e.g. 1/3, 1/6, 1/12, 1/24,
+    1/48, 1/5, 1/7, 1/32, 1/64, 1/128) are returned unchanged. Otherwise, values
+    within ``tol`` (default 1e-3 whole notes) of 0 or of a simple musical
+    rational with denominator <= 192 are snapped cleanly, using a tight pass
+    (1e-4) first so tiny cursor residuals (e.g. 1/40320) preserve exact fine
+    subdivisions.
+    """
+    if val.denominator <= _SNAP_MAX_DENOM:
+        return val
+    if abs(val) <= tol:
+        return Fraction(0)
+    tight = min(_SNAP_TIGHT_TOL, tol)
+    for pass_tol in (tight, tol):
+        for d in _MUSICAL_DENOMINATORS:
+            cand = Fraction(round(val * d), d)
+            if abs(val - cand) <= pass_tol:
+                return cand
+    cand = val.limit_denominator(_SNAP_MAX_DENOM)
+    if abs(val - cand) <= tol:
+        return cand
+    return val
+
 
 def _local_tag(tag: str) -> str:
     """Strip XML namespace URI if present."""
@@ -357,7 +394,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
                         if fifths_txt:
                             new_fifths = int(fifths_txt)
                             if initialized_context and new_fifths != key_fifths:
-                                context_changes.append((1, cursor, "key", str(new_fifths)))
+                                context_changes.append((1, _snap_rational(cursor), "key", str(new_fifths)))
                             key_fifths = new_fifths
 
                     for time_el in _iter_children(child, "time"):
@@ -369,7 +406,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
                             if new_num <= 0 or new_den <= 0:
                                 raise ValueError(f"Invalid time signature {new_num}/{new_den}.")
                             if initialized_context and (new_num != time_num or new_den != time_den):
-                                context_changes.append((1, cursor, "time", f"{new_num}/{new_den}"))
+                                context_changes.append((1, _snap_rational(cursor), "time", f"{new_num}/{new_den}"))
                             time_num = new_num
                             time_den = new_den
 
@@ -380,24 +417,24 @@ def parse_musicxml(xml_str: str) -> CERScore:
                         clef_str = f"{sign}{line}"
                         prev_clef = staff_clefs.get(s_num)
                         if initialized_context and prev_clef is not None and clef_str != prev_clef:
-                            context_changes.append((s_num, cursor, "clef", clef_str))
+                            context_changes.append((s_num, _snap_rational(cursor), "clef", clef_str))
                         staff_clefs[s_num] = clef_str
                         staff_ottava.setdefault(s_num, 0)
                         part_max_staff = max(part_max_staff, s_num)
 
-                    if m_idx == 0 and cursor == 0:
+                    if m_idx == 0 and _snap_rational(cursor) == 0:
                         initialized_context = True
 
                 elif tag == "backup":
                     dur_txt = _child_text(child, "duration")
                     if dur_txt:
                         delta = Fraction(int(dur_txt), 4 * divisions)
-                        cursor = max(Fraction(0), cursor - delta)
+                        cursor = _snap_rational(max(Fraction(0), cursor - delta))
 
                 elif tag == "forward":
                     dur_txt = _child_text(child, "duration")
                     if dur_txt:
-                        cursor += Fraction(int(dur_txt), 4 * divisions)
+                        cursor = _snap_rational(cursor + Fraction(int(dur_txt), 4 * divisions))
 
                 elif tag == "barline":
                     loc = child.attrib.get("location", "right").lower()
@@ -425,11 +462,13 @@ def parse_musicxml(xml_str: str) -> CERScore:
                     dir_staff = max(1, int(_child_text(child, "staff", "1")))
                     part_max_staff = max(part_max_staff, dir_staff)
                     offset_txt = _child_text(child, "offset")
-                    dir_onset = cursor
+                    dir_onset = _snap_rational(cursor)
                     if offset_txt:
-                        dir_onset = max(
-                            Fraction(0),
-                            cursor + Fraction(int(offset_txt), 4 * divisions),
+                        dir_onset = _snap_rational(
+                            max(
+                                Fraction(0),
+                                cursor + Fraction(int(offset_txt), 4 * divisions),
+                            )
                         )
                     for dt in _iter_children(child, "direction-type"):
                         for dt_child in dt:
@@ -485,7 +524,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
                     kind_txt = _child_text(child, "kind", "major")
                     if root_step:
                         h_val = f"{root_step}{root_alt}:{kind_txt}"
-                        directions.append(CERDirection("harmony", h_val, h_staff, cursor))
+                        directions.append(CERDirection("harmony", h_val, h_staff, _snap_rational(cursor)))
 
                 elif tag == "note":
                     initialized_context = True
@@ -503,13 +542,14 @@ def parse_musicxml(xml_str: str) -> CERScore:
 
                     dur_txt = _child_text(child, "duration")
                     if is_grace:
-                        dur = Fraction(0)
+                        raw_dur = Fraction(0)
                     elif dur_txt:
-                        dur = Fraction(int(dur_txt), 4 * divisions)
+                        raw_dur = Fraction(int(dur_txt), 4 * divisions)
                     else:
-                        dur = Fraction(0)
+                        raw_dur = Fraction(0)
+                    dur = _snap_rational(raw_dur)
 
-                    onset = last_note_onset if is_chord else cursor
+                    onset = last_note_onset if is_chord else _snap_rational(cursor)
 
                     if rest_el is not None:
                         is_full = rest_el.attrib.get("measure", "no").lower() == "yes"
@@ -609,13 +649,14 @@ def parse_musicxml(xml_str: str) -> CERScore:
                         note_contexts.append(ctx)
 
                     if not is_chord and not is_grace:
-                        last_note_onset = cursor
-                        cursor += dur
+                        last_note_onset = onset
+                        cursor += raw_dur
 
             # Flush any wedges left open at end of measure
+            snapped_end = _snap_rational(cursor)
             for w_staff, (w_kind, w_start) in open_wedges.items():
                 directions.append(
-                    CERDirection("wedge", w_kind, w_staff, w_start, max(cursor, w_start))
+                    CERDirection("wedge", w_kind, w_staff, w_start, max(snapped_end, w_start))
                 )
 
             measure_contexts = {

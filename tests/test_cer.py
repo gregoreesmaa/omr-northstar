@@ -147,6 +147,142 @@ class TestCERParser(unittest.TestCase):
         self.assertAlmostEqual(res.s_struct, 1.0)
         self.assertAlmostEqual(res.s_expr, 1.0)
 
+    def test_backup_cursor_rounding_residual_snaps_to_zero(self) -> None:
+        """A 1/40320 whole-note <backup> residual must snap to exact onset 0 on staff 2."""
+        # divisions=10080 -> whole note = 40320 ticks, quarter note = 10080 ticks,
+        # 3/4 measure = 30240 ticks; <backup> of 30239 leaves a 1/40320 residual.
+        attrs = (
+            "<attributes>"
+            "<divisions>10080</divisions>"
+            "<staves>2</staves>"
+            "<time><beats>3</beats><beat-type>4</beat-type></time>"
+            '<clef number="1"><sign>G</sign><line>2</line></clef>'
+            '<clef number="2"><sign>F</sign><line>4</line></clef>'
+            "</attributes>"
+        )
+        m_residual = (
+            f'<measure number="1">{attrs}'
+            + _note_xml("E", 5, 10080, voice="1", staff=1)
+            + _note_xml("D", 5, 10080, voice="1", staff=1)
+            + _note_xml("C", 5, 10080, voice="1", staff=1)
+            + "<backup><duration>30239</duration></backup>"
+            + _note_xml("C", 3, 10080, voice="2", staff=2)
+            + _note_xml("G", 2, 10080, voice="2", staff=2)
+            + _note_xml("C", 3, 10080, voice="2", staff=2)
+            + "</measure>"
+        )
+        m_exact = (
+            f'<measure number="1">{attrs}'
+            + _note_xml("E", 5, 10080, voice="1", staff=1)
+            + _note_xml("D", 5, 10080, voice="1", staff=1)
+            + _note_xml("C", 5, 10080, voice="1", staff=1)
+            + "<backup><duration>30240</duration></backup>"
+            + _note_xml("C", 3, 10080, voice="2", staff=2)
+            + _note_xml("G", 2, 10080, voice="2", staff=2)
+            + _note_xml("C", 3, 10080, voice="2", staff=2)
+            + "</measure>"
+        )
+        score_res = parse_musicxml(_wrap_partwise(m_residual))
+        score_exact = parse_musicxml(_wrap_partwise(m_exact))
+
+        staff2_notes = score_res.measures[1].notes
+        self.assertEqual(
+            [n.onset for n in staff2_notes],
+            [Fraction(0), Fraction(1, 4), Fraction(1, 2)],
+        )
+        res = align_and_score_cer(score_res, score_exact)
+        self.assertAlmostEqual(res.f1_t1a, 1.0)
+        self.assertAlmostEqual(res.f1_t1b, 1.0)
+        self.assertAlmostEqual(res.f1_t1c, 1.0)
+        self.assertEqual(res.k_dropped_systems, 0)
+
+    def test_rounded_triplet_durations_snap_to_exact_1_24(self) -> None:
+        """Rounded triplet ticks (1654/40320, 1693/40320) must snap to exact 1/24 whole notes."""
+        # In divisions=10080 (40320 ticks/whole), a 3-note eighth-triplet group sums to
+        # 5040 ticks (1/8 whole), often rounded as 1654 + 1693 + 1693 = 5040.
+        attrs_rounded = (
+            "<attributes>"
+            "<divisions>10080</divisions>"
+            "<time><beats>3</beats><beat-type>8</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef>"
+            "</attributes>"
+        )
+        # 3 triplet groups = 9 notes (total 3/8 whole)
+        rounded_notes = (
+            _note_xml("C", 5, 1654)
+            + _note_xml("D", 5, 1693)
+            + _note_xml("E", 5, 1693)
+            + _note_xml("F", 5, 1654)
+            + _note_xml("G", 5, 1693)
+            + _note_xml("A", 5, 1693)
+            + _note_xml("G", 5, 1654)
+            + _note_xml("F", 5, 1693)
+            + _note_xml("E", 5, 1693)
+        )
+        xml_rounded = _wrap_partwise(f'<measure number="1">{attrs_rounded}{rounded_notes}</measure>')
+
+        # Exact reference using divisions=6 (24 ticks/whole -> 1 tick = 1/24 whole)
+        attrs_exact = (
+            "<attributes>"
+            "<divisions>6</divisions>"
+            "<time><beats>3</beats><beat-type>8</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef>"
+            "</attributes>"
+        )
+        exact_notes = "".join(
+            _note_xml(step, 5, 1)
+            for step in ("C", "D", "E", "F", "G", "A", "G", "F", "E")
+        )
+        xml_exact = _wrap_partwise(f'<measure number="1">{attrs_exact}{exact_notes}</measure>')
+
+        score_rounded = parse_musicxml(xml_rounded)
+        score_exact = parse_musicxml(xml_exact)
+
+        parsed_notes = score_rounded.measures[0].notes
+        self.assertEqual([n.duration for n in parsed_notes], [Fraction(1, 24)] * 9)
+        self.assertEqual(
+            [n.onset for n in parsed_notes],
+            [Fraction(i, 24) for i in range(9)],
+        )
+
+        res = align_and_score_cer(score_rounded, score_exact)
+        self.assertAlmostEqual(res.f1_t1a, 1.0)
+        self.assertAlmostEqual(res.f1_t1b, 1.0)
+        self.assertAlmostEqual(res.f1_t1c, 1.0)
+        self.assertAlmostEqual(res.bsvr, 1.0)
+        self.assertAlmostEqual(res.mer, 1.0)
+
+    def test_exact_musical_subdivisions_preserved(self) -> None:
+        """Exact tuplets and fine subdivisions (1/3..1/128) must not be distorted."""
+        # divisions = 13440 -> 4*divisions = 53760, divisible by 3,5,7,12,24,48,32,64,128
+        exact_durs = [
+            Fraction(1, 3),
+            Fraction(1, 6),
+            Fraction(1, 12),
+            Fraction(1, 24),
+            Fraction(1, 48),
+            Fraction(1, 5),
+            Fraction(1, 10),
+            Fraction(1, 20),
+            Fraction(1, 7),
+            Fraction(1, 14),
+            Fraction(1, 32),
+            Fraction(1, 64),
+            Fraction(1, 128),
+        ]
+        divisions = 13440  # 4 * divisions = 53760 (divisible by 128, 3, 5, 7)
+        attrs = (
+            f"<attributes><divisions>{divisions}</divisions>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+        )
+        notes_xml = "".join(
+            _note_xml("C", 4, int(d * 4 * divisions))
+            for d in exact_durs
+        )
+        score = parse_musicxml(_wrap_partwise(f'<measure number="1">{attrs}{notes_xml}</measure>'))
+        self.assertEqual([n.duration for n in score.measures[0].notes], exact_durs)
+
 
 class TestTwoStageAlignment(unittest.TestCase):
     """Verify enharmonic distinction, voice-ID permutation invariance, and NW DP recovery."""
