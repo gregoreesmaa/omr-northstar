@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Hashable, Sequence
 
-from .scoring import PageMetrics, compute_effective_measure_cost
+from .scoring import ERROR_BUCKET_KEYS, PageMetrics, compute_effective_measure_cost
 
 STEP_TO_SEMITONE: dict[str, int] = {
     "C": 0,
@@ -160,6 +160,16 @@ class CERRest:
 
 
 @dataclass(frozen=True)
+class CERForward:
+    """Canonical MusicXML <forward> cursor advance (in whole notes)."""
+
+    staff: int
+    voice: str | None
+    onset: Fraction
+    duration: Fraction
+
+
+@dataclass(frozen=True)
 class CERDirection:
     """Expressive or textual attachment anchored to a staff and rational onset."""
 
@@ -188,6 +198,7 @@ class CERMeasure:
     notes: tuple[CERNote, ...] = ()
     note_contexts: tuple[CERContext, ...] = ()
     rests: tuple[CERRest, ...] = ()
+    forwards: tuple[CERForward, ...] = ()
     directions: tuple[CERDirection, ...] = ()
 
 
@@ -234,6 +245,7 @@ class CERAlignmentResult:
     k_dropped_systems: int
     has_repetition_loop: bool
     measure_alignment: tuple[tuple[int | None, int | None], ...]
+    error_buckets: dict[str, float] = field(default_factory=dict)
 
 
 def _split_multistaff_part(
@@ -277,6 +289,7 @@ def _split_multistaff_part(
                     s_note_ctxs.append(ctx)
 
             s_rests = tuple(replace(r, staff=1) for r in m.rests if r.staff == s)
+            s_forwards = tuple(replace(f, staff=1) for f in m.forwards if f.staff == s)
             s_dirs = tuple(replace(d, staff=1) for d in m.directions if d.staff == s)
             s_ctx_changes = tuple(
                 (1, c_onset, c_kind, c_val)
@@ -300,6 +313,7 @@ def _split_multistaff_part(
                     notes=tuple(s_notes),
                     note_contexts=tuple(s_note_ctxs),
                     rests=s_rests,
+                    forwards=s_forwards,
                     directions=s_dirs,
                 )
             )
@@ -362,6 +376,11 @@ def parse_musicxml(xml_str: str) -> CERScore:
             notes: list[CERNote] = []
             note_contexts: list[CERContext] = []
             rests: list[CERRest] = []
+            raw_forwards: list[tuple[int, Fraction, Fraction, str | None, int | None]] = []
+            seg_idx = 0
+            seg_voices: dict[int, set[str]] = defaultdict(set)
+            seg_voice_staves: dict[tuple[int, str], set[int]] = defaultdict(set)
+            measure_voice_staves: dict[str, set[int]] = defaultdict(set)
             directions: list[CERDirection] = []
             context_changes: list[tuple[int, Fraction, str, str]] = []
             open_wedges: dict[int, tuple[str, Fraction]] = {}
@@ -401,7 +420,8 @@ def parse_musicxml(xml_str: str) -> CERScore:
                         beats_txt = _child_text(time_el, "beats")
                         btype_txt = _child_text(time_el, "beat-type")
                         if beats_txt and btype_txt:
-                            new_num = int(beats_txt.split("+")[0])
+                            beat_parts = [int(tok.strip()) for tok in beats_txt.split("+") if tok.strip()]
+                            new_num = sum(beat_parts) if beat_parts else 0
                             new_den = int(btype_txt)
                             if new_num <= 0 or new_den <= 0:
                                 raise ValueError(f"Invalid time signature {new_num}/{new_den}.")
@@ -430,11 +450,24 @@ def parse_musicxml(xml_str: str) -> CERScore:
                     if dur_txt:
                         delta = Fraction(int(dur_txt), 4 * divisions)
                         cursor = _snap_rational(max(Fraction(0), cursor - delta))
+                    seg_idx += 1
 
                 elif tag == "forward":
                     dur_txt = _child_text(child, "duration")
                     if dur_txt:
-                        cursor = _snap_rational(cursor + Fraction(int(dur_txt), 4 * divisions))
+                        fwd_ticks = int(dur_txt)
+                        fwd_onset = _snap_rational(cursor)
+                        fwd_raw = Fraction(fwd_ticks, 4 * divisions)
+                        fwd_dur = _snap_rational(fwd_raw)
+                        if fwd_ticks > 0:
+                            fwd_voice_txt = _child_text(child, "voice")
+                            fwd_voice = fwd_voice_txt if fwd_voice_txt else None
+                            fwd_staff_txt = _child_text(child, "staff")
+                            fwd_staff = max(1, int(fwd_staff_txt)) if fwd_staff_txt else None
+                            if fwd_staff is not None:
+                                part_max_staff = max(part_max_staff, fwd_staff)
+                            raw_forwards.append((seg_idx, fwd_onset, fwd_dur, fwd_voice, fwd_staff))
+                        cursor = _snap_rational(cursor + fwd_raw)
 
                 elif tag == "barline":
                     loc = child.attrib.get("location", "right").lower()
@@ -549,7 +582,14 @@ def parse_musicxml(xml_str: str) -> CERScore:
                         raw_dur = Fraction(0)
                     dur = _snap_rational(raw_dur)
 
-                    onset = last_note_onset if is_chord else _snap_rational(cursor)
+                    onset = (
+                        _snap_rational(cursor)
+                        if is_grace
+                        else (last_note_onset if is_chord else _snap_rational(cursor))
+                    )
+                    seg_voices[seg_idx].add(voice)
+                    seg_voice_staves[(seg_idx, voice)].add(staff)
+                    measure_voice_staves[voice].add(staff)
 
                     if rest_el is not None:
                         is_full = rest_el.attrib.get("measure", "no").lower() == "yes"
@@ -659,6 +699,33 @@ def parse_musicxml(xml_str: str) -> CERScore:
                     CERDirection("wedge", w_kind, w_staff, w_start, max(snapped_end, w_start))
                 )
 
+            # Resolve <forward> voice and staff attribution within <backup>-delimited segments
+            resolved_forwards: list[CERForward] = []
+            for f_seg, f_onset, f_dur, f_voice, f_staff in raw_forwards:
+                voice_res = f_voice
+                if voice_res is None:
+                    s_voices = seg_voices.get(f_seg, set())
+                    if len(s_voices) == 1:
+                        voice_res = next(iter(s_voices))
+                staff_res = f_staff
+                if staff_res is None:
+                    if voice_res is not None:
+                        sv_staves = seg_voice_staves.get((f_seg, voice_res)) or measure_voice_staves.get(voice_res)
+                        if sv_staves and len(sv_staves) == 1:
+                            staff_res = next(iter(sv_staves))
+                        else:
+                            staff_res = 1
+                    else:
+                        staff_res = 1
+                resolved_forwards.append(
+                    CERForward(
+                        staff=staff_res,
+                        voice=voice_res,
+                        onset=f_onset,
+                        duration=f_dur,
+                    )
+                )
+
             measure_contexts = {
                 s_i: CERContext(
                     clef=staff_clefs.get(s_i, "F4" if s_i == 2 else "G2"),
@@ -685,6 +752,7 @@ def parse_musicxml(xml_str: str) -> CERScore:
                     notes=tuple(notes),
                     note_contexts=tuple(note_contexts),
                     rests=tuple(rests),
+                    forwards=tuple(resolved_forwards),
                     directions=tuple(directions),
                 )
             )
@@ -911,8 +979,8 @@ def _optimal_voice_bijection(
     return mapping
 
 
-def _compute_bsvr(measures: Sequence[CERMeasure]) -> float:
-    """Beat-Sum Validity Rate across predicted (measure, staff, voice) streams."""
+def _compute_bsvr_counts(measures: Sequence[CERMeasure]) -> tuple[int, int]:
+    """Return (valid_streams, total_streams) for Beat-Sum Validity Rate."""
     valid = 0
     total = 0
     for m in measures:
@@ -924,6 +992,10 @@ def _compute_bsvr(measures: Sequence[CERMeasure]) -> float:
                 by_sv[(n.staff, n.voice)] += n.duration
         for r in m.rests:
             by_sv[(r.staff, r.voice)] += r.duration
+        # Credit MusicXML <forward> cursor advances toward active voice streams
+        for f in m.forwards:
+            if f.voice is not None and (f.staff, f.voice) in by_sv:
+                by_sv[(f.staff, f.voice)] += f.duration
         for (staff, _voice), dur_sum in by_sv.items():
             if dur_sum == 0:
                 continue
@@ -932,6 +1004,12 @@ def _compute_bsvr(measures: Sequence[CERMeasure]) -> float:
             total += 1
             if dur_sum == expected:
                 valid += 1
+    return valid, total
+
+
+def _compute_bsvr(measures: Sequence[CERMeasure]) -> float:
+    """Beat-Sum Validity Rate across predicted (measure, staff, voice) streams."""
+    valid, total = _compute_bsvr_counts(measures)
     if total == 0:
         return 1.0
     return valid / total
@@ -973,35 +1051,164 @@ def _extract_sounding_events(score: CERScore) -> Counter[Hashable]:
     return events
 
 
-def _has_repetition_loop(pred_measures: Sequence[CERMeasure], gt_measures: Sequence[CERMeasure]) -> bool:
-    """Detect measure n-gram (n >= 2) repeating >= 3x consecutively when absent in GT."""
+def _has_repetition_loop(
+    pred_measures: Sequence[CERMeasure],
+    gt_measures: Sequence[CERMeasure],
+    alignment: Sequence[tuple[int | None, int | None]] | None = None,
+) -> bool:
+    """Detect runaway decoder repetition loops while sparing genuine musical ostinatos.
+
+    Flags a predicted part stream when a non-empty measure n-gram (n in {2, 3, 4})
+    repeats >= 3x consecutively and either:
+      - extends beyond the corresponding GT repetition with runaway length inflation, or
+      - is absent in GT and is NOT explained by a genuine GT ostinato (either high
+        aligned measure similarity >= 0.70 or a matching >= 3x consecutive n-gram
+        ostinato structure in GT without runaway measure inflation).
+    """
     def _sig(m: CERMeasure) -> tuple[tuple[int, Fraction], ...]:
         return tuple(sorted((n.midi, n.duration) for n in m.notes))
 
-    pred_sigs = [_sig(m) for m in pred_measures]
-    gt_sigs = [_sig(m) for m in gt_measures]
+    def _group_by_part(
+        measures: Sequence[CERMeasure],
+    ) -> list[tuple[str, list[tuple[int, CERMeasure]]]]:
+        grouped: dict[str, list[tuple[int, CERMeasure]]] = {}
+        order: list[str] = []
+        for idx, m in enumerate(measures):
+            if m.part_id not in grouped:
+                grouped[m.part_id] = []
+                order.append(m.part_id)
+            grouped[m.part_id].append((idx, m))
+        return [(pid, grouped[pid]) for pid in order]
 
-    if len(pred_sigs) < 6:
-        return False
-
-    for n_gram in (2, 3, 4):
-        if len(pred_sigs) < 3 * n_gram:
-            continue
-        gt_triples = {
-            tuple(gt_sigs[i : i + 3 * n_gram])
-            for i in range(max(0, len(gt_sigs) - 3 * n_gram + 1))
-        }
-        for i in range(len(pred_sigs) - 3 * n_gram + 1):
-            chunk = tuple(pred_sigs[i : i + n_gram])
-            if not any(chunk):  # ignore all-empty measures
+    def _has_any_triple(sigs: Sequence[tuple[tuple[int, Fraction], ...]], n_gram: int) -> bool:
+        if len(sigs) < 3 * n_gram:
+            return False
+        for i in range(len(sigs) - 3 * n_gram + 1):
+            chunk = tuple(sigs[i : i + n_gram])
+            if not any(chunk):
                 continue
             if (
-                tuple(pred_sigs[i + n_gram : i + 2 * n_gram]) == chunk
-                and tuple(pred_sigs[i + 2 * n_gram : i + 3 * n_gram]) == chunk
+                tuple(sigs[i + n_gram : i + 2 * n_gram]) == chunk
+                and tuple(sigs[i + 2 * n_gram : i + 3 * n_gram]) == chunk
             ):
-                triple = tuple(pred_sigs[i : i + 3 * n_gram])
-                if triple not in gt_triples:
-                    return True
+                return True
+        return False
+
+    def _max_chunk_run(
+        sigs: Sequence[tuple[tuple[int, Fraction], ...]],
+        chunk: tuple[tuple[tuple[int, Fraction], ...], ...],
+        n_gram: int,
+    ) -> int:
+        best = 0
+        for i in range(len(sigs) - n_gram + 1):
+            if tuple(sigs[i : i + n_gram]) == chunk:
+                reps = 1
+                while (
+                    i + (reps + 1) * n_gram <= len(sigs)
+                    and tuple(sigs[i + reps * n_gram : i + (reps + 1) * n_gram]) == chunk
+                ):
+                    reps += 1
+                if reps > best:
+                    best = reps
+        return best
+
+    pred_parts = _group_by_part(pred_measures)
+    gt_parts = _group_by_part(gt_measures)
+
+    # Map global pred measure index -> aligned global gt measure index (or None)
+    pred_to_gt: dict[int, int | None] = {}
+    if alignment is not None:
+        for p_idx, g_idx in alignment:
+            if p_idx is not None:
+                pred_to_gt[p_idx] = g_idx
+
+    all_gt_sigs = [_sig(m) for m in gt_measures]
+
+    for p_part_idx, (_pid, p_items) in enumerate(pred_parts):
+        if len(p_items) < 6:
+            continue
+        p_sigs = [_sig(m) for _, m in p_items]
+        if p_part_idx < len(gt_parts):
+            g_items = gt_parts[p_part_idx][1]
+            g_sigs = [_sig(m) for _, m in g_items]
+        else:
+            g_items = []
+            g_sigs = all_gt_sigs
+        gt_part_len = len(g_sigs)
+
+        for n_gram in (2, 3, 4):
+            if len(p_sigs) < 3 * n_gram:
+                continue
+            gt_triples = {
+                tuple(g_sigs[k : k + 3 * n_gram])
+                for k in range(max(0, len(g_sigs) - 3 * n_gram + 1))
+            }
+            gt_has_ostinato = _has_any_triple(g_sigs, n_gram)
+            runaway_len = (
+                gt_part_len > 0
+                and len(p_sigs) > max(gt_part_len + 2, int(1.25 * gt_part_len))
+            )
+
+            for i in range(len(p_sigs) - 3 * n_gram + 1):
+                chunk = tuple(p_sigs[i : i + n_gram])
+                if not any(chunk):  # ignore all-empty measures
+                    continue
+                if not (
+                    tuple(p_sigs[i + n_gram : i + 2 * n_gram]) == chunk
+                    and tuple(p_sigs[i + 2 * n_gram : i + 3 * n_gram]) == chunk
+                ):
+                    continue
+
+                triple = tuple(p_sigs[i : i + 3 * n_gram])
+                if triple in gt_triples:
+                    # Exact GT ostinato; only flag if pred runs away far beyond GT's run
+                    if runaway_len:
+                        pred_reps = 3
+                        while (
+                            i + (pred_reps + 1) * n_gram <= len(p_sigs)
+                            and tuple(
+                                p_sigs[i + pred_reps * n_gram : i + (pred_reps + 1) * n_gram]
+                            )
+                            == chunk
+                        ):
+                            pred_reps += 1
+                        gt_reps = _max_chunk_run(g_sigs, chunk, n_gram)
+                        if pred_reps > gt_reps:
+                            return True
+                    continue
+
+                # Candidate loop not verbatim in GT: distinguish genuine ostinato from loop
+                span_len = 3 * n_gram
+                no_measure_inflation = gt_part_len > 0 and len(p_sigs) <= max(
+                    gt_part_len, int(1.15 * gt_part_len)
+                )
+
+                aligned_count = 0
+                sim_sum = 0.0
+                for offset in range(span_len):
+                    p_global_idx, p_meas = p_items[i + offset]
+                    if alignment is not None:
+                        g_global_idx = pred_to_gt.get(p_global_idx)
+                        g_meas = gt_measures[g_global_idx] if g_global_idx is not None else None
+                    elif i + offset < len(g_items):
+                        g_meas = g_items[i + offset][1]
+                    else:
+                        g_meas = None
+                    if g_meas is not None:
+                        aligned_count += 1
+                        sim_sum += _measure_similarity(p_meas, g_meas)
+
+                aligned_frac = aligned_count / span_len
+                mean_sim = sim_sum / span_len
+
+                # Genuine ostinato with minor read error or subtle GT variation
+                if aligned_frac >= (5.0 / 6.0) and (
+                    (mean_sim >= 0.70 and no_measure_inflation)
+                    or (gt_has_ostinato and no_measure_inflation)
+                ):
+                    continue
+
+                return True
     return False
 
 
@@ -1041,6 +1248,13 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
     total_transcribe = 0.0
     gt_measure_matched_notes: dict[int, int] = {}
 
+    # Layer 3 raw error-bucket accumulators
+    err_layout = 0.0
+    err_pitch = 0.0
+    err_rhythm = 0.0
+    err_poly = 0.0
+    err_halluc = 0.0
+
     for p_idx, g_idx in alignment:
         mp = pred.measures[p_idx] if p_idx is not None else None
         mg = gt.measures[g_idx] if g_idx is not None else None
@@ -1049,6 +1263,7 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
             # Extra hallucinated predicted measure
             extra_edit = 5.0 + 2.5 * len(mp.notes) + 1.0 * len(mp.rests)
             total_wfpp += extra_edit
+            err_halluc += 1.0 + len(mp.notes) + len(mp.rests)
             expr_counts["ctx"][1] += len(mp.context_changes)
             expr_counts["art"][1] += sum(len(n.articulations) for n in mp.notes)
             expr_counts["dyn"][1] += sum(1 for d in mp.directions if d.kind in ("dynamic", "wedge"))
@@ -1065,6 +1280,7 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
             m_tc = _measure_transcribe_cost(mg)
             total_transcribe += m_tc
             total_wfpp += compute_effective_measure_cost(5.0 + m_tc, m_tc)
+            err_layout += 1.0 + len(mg.notes) + len(mg.rests)
             gt_measure_matched_notes[g_idx] = 0  # type: ignore[index]
             expr_counts["ctx"][2] += len(mg.context_changes)
             expr_counts["art"][2] += sum(len(n.articulations) for n in mg.notes)
@@ -1087,6 +1303,8 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
         )
         if bar_ok:
             matched_barlines += 1
+        else:
+            err_layout += 1.0
 
         # Stage 2: per-staff optimal voice bijection
         staves = sorted(
@@ -1156,6 +1374,22 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
         matched_t1c += m_t1c
         gt_measure_matched_notes[g_idx] = m_t1c
 
+        # Separate enharmonic spelling mismatches from polyphony/voice routing mismatches
+        c_p_spell: Counter[Hashable] = Counter(
+            (n.midi, n.onset, n.duration, n.grace, n.tuplet, n.step, n.alter, n.octave)
+            for n in mp.notes
+        )
+        c_g_spell: Counter[Hashable] = Counter(
+            (n.midi, n.onset, n.duration, n.grace, n.tuplet, n.step, n.alter, n.octave)
+            for n in mg.notes
+        )
+        m_spell = _multiset_intersection_size(c_p_spell, c_g_spell)
+        spell_err = max(0, m_t1b - m_spell)
+        poly_err = max(0, m_spell - m_t1c)
+        err_pitch += max(0, (len(mp.notes) - m_t1a) + (len(mg.notes) - m_t1a)) + spell_err
+        err_rhythm += max(0, m_t1a - m_t1b)
+        err_poly += poly_err
+
         # Active Context State Accuracy (A_state) at every matched strict note onset
         for k, cnt in (c_p_t1c & c_g_t1c).items():
             p_ctxs = p_strict_with_ctx[k]
@@ -1175,6 +1409,7 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
         )
         m_rest = _multiset_intersection_size(c_p_rest, c_g_rest)
         matched_rests += m_rest
+        err_rhythm += max(0, (len(mp.rests) - m_rest) + (len(mg.rests) - m_rest))
 
         # Measure-Exact Rate (MER)
         m_bsvr = _compute_bsvr([mp])
@@ -1292,7 +1527,8 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
 
     mer = (exact_measures / m_gt) if m_gt > 0 else (1.0 if m_pred == 0 else 0.0)
     f1_bar = _f1_from_counts(matched_barlines, m_pred, m_gt)
-    bsvr = _compute_bsvr(pred.measures)
+    bsvr_valid, bsvr_total = _compute_bsvr_counts(pred.measures)
+    bsvr = (bsvr_valid / bsvr_total) if bsvr_total > 0 else 1.0
     a_state = (ctx_matched / ctx_total) if ctx_total > 0 else (1.0 if n_gt == 0 and n_pred == 0 else 0.0)
 
     # S_struct: renormalize weights over active components (MER=0.25, F1_bar=0.20, BSVR=0.15, A_state=0.20)
@@ -1330,7 +1566,44 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
             if (sys_matched / sys_gt_notes) < 0.15:
                 k_dropped += 1
 
-    rep_loop = _has_repetition_loop(pred.measures, gt.measures)
+    rep_loop = _has_repetition_loop(pred.measures, gt.measures, alignment=alignment)
+
+    # Layer 3 8-bucket error taxonomy percentages
+    err_layout += 4.0 * k_dropped
+    err_ctx = float(ctx_total - ctx_matched) + float(
+        expr_counts["ctx"][1] + expr_counts["ctx"][2] - 2 * expr_counts["ctx"][0]
+    )
+    err_rhythm += float(bsvr_total - bsvr_valid)
+    err_expr = float(
+        sum(
+            expr_counts[k][1] + expr_counts[k][2] - 2 * expr_counts[k][0]
+            for k in ("art", "dyn", "tie_slur", "text")
+        )
+    )
+    if rep_loop:
+        err_halluc += 4.0
+    if n_gt > 0 and n_pred == 0:
+        err_halluc += float(n_gt)
+    elif n_gt == 0 and n_pred > 0:
+        err_halluc += float(n_pred)
+
+    raw_buckets = {
+        "layout_segmentation_pct": max(0.0, err_layout),
+        "global_context_drift_pct": max(0.0, err_ctx),
+        "pitch_accidental_pct": max(0.0, err_pitch),
+        "rhythm_meter_pct": max(0.0, err_rhythm),
+        "polyphony_routing_pct": max(0.0, err_poly),
+        "engraving_expressive_pct": max(0.0, err_expr),
+        "hallucination_truncation_pct": max(0.0, err_halluc),
+        "annotation_contamination_pct": 0.0,
+    }
+    raw_total = sum(raw_buckets.values())
+    if raw_total > 0.0:
+        error_buckets = {
+            k: round((100.0 * raw_buckets[k]) / raw_total, 4) for k in ERROR_BUCKET_KEYS
+        }
+    else:
+        error_buckets = {k: 0.0 for k in ERROR_BUCKET_KEYS}
 
     return CERAlignmentResult(
         f1_t1a=f1_t1a,
@@ -1354,6 +1627,7 @@ def align_and_score_cer(pred: CERScore, gt: CERScore) -> CERAlignmentResult:
         k_dropped_systems=k_dropped,
         has_repetition_loop=rep_loop,
         measure_alignment=tuple(alignment),
+        error_buckets=error_buckets,
     )
 
 
@@ -1376,6 +1650,10 @@ def score_musicxml_pair(
     try:
         pred_score = parse_musicxml(pred_xml)
     except (ET.ParseError, ValueError):
+        unparseable_buckets = {
+            k: (100.0 if k == "hallucination_truncation_pct" else 0.0)
+            for k in ERROR_BUCKET_KEYS
+        }
         return PageMetrics(
             page_id=page_id,
             work_id=work_id,
@@ -1397,6 +1675,7 @@ def score_musicxml_pair(
             m_pred=0,
             paired_anchor_id=paired_anchor_id,
             engraver=engraver,
+            error_buckets=unparseable_buckets,
             latency_s=latency_s,
         )
 
@@ -1422,5 +1701,6 @@ def score_musicxml_pair(
         m_pred=res.m_pred,
         paired_anchor_id=paired_anchor_id,
         engraver=engraver,
+        error_buckets=res.error_buckets,
         latency_s=latency_s,
     )

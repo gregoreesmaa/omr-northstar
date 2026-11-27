@@ -11,7 +11,8 @@ from omr_northstar.cer import (
     parse_musicxml,
     score_musicxml_pair,
 )
-from omr_northstar.scoring import DOMAINS, build_report, compute_page_quality
+from omr_northstar.scoring import DOMAINS, ERROR_BUCKET_KEYS, build_report, compute_page_quality
+from omr_northstar.validate import validate_report
 
 
 def _wrap_partwise(measures_xml: str, part_id: str = "P1") -> str:
@@ -501,6 +502,227 @@ class TestTwoStageAlignment(unittest.TestCase):
             self.assertAlmostEqual(pm.s_play, 1.0)
             self.assertFalse(q.catastrophic_failure)
             self.assertAlmostEqual(q.q_score, 100.0)
+
+
+class TestForwardBSVRAndEdgeCases(unittest.TestCase):
+    """Verify MusicXML <forward> BSVR accounting, additive meters, grace chords, and Layer 3 taxonomy."""
+
+    def test_sparse_polyphonic_forward_explicit_and_inferred_staff_bsvr(self) -> None:
+        """Valid sparse secondary voices using <forward> must achieve BSVR = 1.0."""
+        m1 = (
+            '<measure number="1">'
+            "<attributes>"
+            "<divisions>2</divisions>"
+            "<staves>2</staves>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            '<clef number="1"><sign>G</sign><line>2</line></clef>'
+            '<clef number="2"><sign>F</sign><line>4</line></clef>'
+            "</attributes>"
+            # Staff 1, Voice 1: full 4/4 (8 ticks)
+            + _note_xml("C", 5, 4, voice="1", staff=1)
+            + _note_xml("D", 5, 4, voice="1", staff=1)
+            + "<backup><duration>8</duration></backup>"
+            # Staff 1, Voice 2: sparse voice using explicit <forward> + note + <forward>
+            + "<forward><duration>4</duration><voice>2</voice><staff>1</staff></forward>"
+            + _note_xml("A", 4, 2, voice="2", staff=1)
+            + "<forward><duration>2</duration><voice>2</voice><staff>1</staff></forward>"
+            + "<backup><duration>8</duration></backup>"
+            # Staff 2, Voice 5: <forward> with <voice> but omitted <staff> (inferred from note)
+            + "<forward><duration>4</duration><voice>5</voice></forward>"
+            + _note_xml("C", 3, 4, voice="5", staff=2)
+            + "</measure>"
+        )
+        score = parse_musicxml(_wrap_partwise(m1))
+        res = align_and_score_cer(score, score)
+        self.assertAlmostEqual(res.bsvr, 1.0)
+        self.assertAlmostEqual(res.mer, 1.0)
+        self.assertAlmostEqual(res.s_struct, 1.0)
+
+    def test_voiceless_forward_and_empty_forward_segment_handling(self) -> None:
+        """Voiceless <forward> in a single-voice segment credits that voice; empty forward-only jumps do not."""
+        m1 = (
+            '<measure number="1">'
+            "<attributes><divisions>2</divisions>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            + _note_xml("G", 4, 4, voice="1", staff=1)
+            + _note_xml("B", 4, 4, voice="1", staff=1, chord=True)
+            + "<forward><duration>2</duration></forward>"
+            + _note_xml("D", 5, 2, voice="1", staff=1)
+            # Trailing cursor-only forward segment with no notes/rests must not fail BSVR
+            + "<backup><duration>8</duration></backup>"
+            + "<forward><duration>4</duration></forward>"
+            + "</measure>"
+        )
+        score = parse_musicxml(_wrap_partwise(m1))
+        res = align_and_score_cer(score, score)
+        self.assertAlmostEqual(res.bsvr, 1.0)
+        self.assertAlmostEqual(res.mer, 1.0)
+
+        # Genuine underfull measure without <forward> must still fail BSVR
+        m_under = (
+            '<measure number="1">'
+            "<attributes><divisions>2</divisions>"
+            "<time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            + _note_xml("G", 4, 4, voice="1", staff=1)
+            + _note_xml("D", 5, 2, voice="1", staff=1)
+            + "</measure>"
+        )
+        score_under = parse_musicxml(_wrap_partwise(m_under))
+        res_under = align_and_score_cer(score_under, score_under)
+        self.assertAlmostEqual(res_under.bsvr, 0.0)
+
+    def test_additive_time_signature_and_grace_chord_onset(self) -> None:
+        """Additive meter (2+3/8) sums beats to 5/8, and grace chords share current cursor onset."""
+        m1 = (
+            '<measure number="1">'
+            "<attributes><divisions>2</divisions>"
+            "<time><beats>2+3</beats><beat-type>8</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            + _note_xml("C", 4, 2)  # beat 1: onset 0, dur 1/4
+            # Grace chord at onset 1/4 (must NOT inherit last_note_onset=0)
+            + "<note><grace/><pitch><step>D</step><octave>4</octave></pitch><voice>1</voice><staff>1</staff></note>"
+            + "<note><grace/><chord/><pitch><step>F</step><octave>4</octave></pitch><voice>1</voice><staff>1</staff></note>"
+            + _note_xml("E", 4, 3)  # onset 1/4, dur 3/8 -> total 5/8
+            + "</measure>"
+        )
+        score = parse_musicxml(_wrap_partwise(m1))
+        meas = score.measures[0]
+        self.assertEqual(meas.contexts[1].time_num, 5)
+        self.assertEqual(meas.contexts[1].time_den, 8)
+        grace_notes = [n for n in meas.notes if n.grace]
+        self.assertEqual(len(grace_notes), 2)
+        self.assertEqual([n.onset for n in grace_notes], [Fraction(1, 4), Fraction(1, 4)])
+        res = align_and_score_cer(score, score)
+        self.assertAlmostEqual(res.bsvr, 1.0)
+        self.assertAlmostEqual(res.mer, 1.0)
+
+    def test_layer3_error_taxonomy_populated_and_schema_valid(self) -> None:
+        """score_musicxml_pair populates Layer 3 error_buckets for build_report()."""
+        attrs = (
+            "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+        )
+        gt_xml = _wrap_partwise(
+            f'<measure number="1">{attrs}' + _note_xml("C", 4, 2) + _note_xml("E", 4, 2) + "</measure>"
+        )
+        # Pitch error on note 2 (F4 instead of E4)
+        pred_xml = _wrap_partwise(
+            f'<measure number="1">{attrs}' + _note_xml("C", 4, 2) + _note_xml("F", 4, 2) + "</measure>"
+        )
+        pm_err = score_musicxml_pair(
+            pred_xml, gt_xml, page_id="p_err", work_id="w1", domain="CDR", tier="T1"
+        )
+        self.assertIsNotNone(pm_err.error_buckets)
+        assert pm_err.error_buckets is not None
+        self.assertEqual(set(pm_err.error_buckets.keys()), set(ERROR_BUCKET_KEYS))
+        self.assertAlmostEqual(sum(pm_err.error_buckets.values()), 100.0, places=2)
+        self.assertGreater(pm_err.error_buckets["pitch_accidental_pct"], 50.0)
+
+        # Exact match yields all-zero error buckets
+        pm_ok = score_musicxml_pair(
+            gt_xml, gt_xml, page_id="p_ok", work_id="w2", domain="ALS", tier="T1"
+        )
+        assert pm_ok.error_buckets is not None
+        self.assertEqual(sum(pm_ok.error_buckets.values()), 0.0)
+
+        report = build_report(
+            [
+                pm_err,
+                pm_ok,
+                score_musicxml_pair(gt_xml, gt_xml, page_id="p_rwp", work_id="w3", domain="RWP", tier="T1"),
+                score_musicxml_pair(gt_xml, gt_xml, page_id="p_hwm", work_id="w4", domain="HWM", tier="T1"),
+            ],
+            system_name="taxonomy-test",
+        )
+        self.assertEqual(validate_report(report), [])
+        self.assertGreater(report["layer3_error_taxonomy"]["pitch_accidental_pct"], 0.0)
+
+
+class TestRepetitionLoopVsOstinato(unittest.TestCase):
+    """Verify _has_repetition_loop spares genuine ostinatos while flagging runaway loops."""
+
+    @staticmethod
+    def _bar(num: int, notes: list[tuple[str, int, int]], with_attrs: bool = False) -> str:
+        attrs = (
+            "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time>"
+            "<clef><sign>G</sign><line>2</line></clef></attributes>"
+            if with_attrs
+            else ""
+        )
+        body = "".join(_note_xml(step, octv, dur) for step, octv, dur in notes)
+        return f'<measure number="{num}">{attrs}{body}</measure>'
+
+    def test_genuine_ostinato_with_minor_read_error_not_flagged(self) -> None:
+        """A genuine 6-bar ostinato misread by one pitch must NOT trigger hallucination_loop."""
+        pat_gt = [("C", 4, 1), ("E", 4, 1), ("G", 4, 1), ("E", 4, 1)]
+        pat_pred = [("C", 4, 1), ("E", 4, 1), ("A", 4, 1), ("E", 4, 1)]
+        gt_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, pat_gt, with_attrs=(i == 0)) for i in range(6))
+        )
+        pred_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, pat_pred, with_attrs=(i == 0)) for i in range(6))
+        )
+        res = align_and_score_cer(parse_musicxml(pred_xml), parse_musicxml(gt_xml))
+        self.assertFalse(res.has_repetition_loop)
+
+    def test_genuine_ostinato_with_subtle_gt_variation_not_flagged(self) -> None:
+        """Smoothing a 1-note variation inside a 6-bar ostinato must NOT trigger hallucination_loop."""
+        pat = [("C", 4, 1), ("E", 4, 1), ("G", 4, 1), ("E", 4, 1)]
+        pat_var = [("C", 4, 1), ("E", 4, 1), ("A", 4, 1), ("E", 4, 1)]
+        gt_bars = [pat, pat, pat, pat, pat_var, pat]
+        gt_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, b, with_attrs=(i == 0)) for i, b in enumerate(gt_bars))
+        )
+        pred_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, pat, with_attrs=(i == 0)) for i in range(6))
+        )
+        res = align_and_score_cer(parse_musicxml(pred_xml), parse_musicxml(gt_xml))
+        self.assertFalse(res.has_repetition_loop)
+
+    def test_runaway_hallucination_loop_on_varied_score_flagged(self) -> None:
+        """Decoder runaway repetition on a varied score MUST trigger hallucination_loop."""
+        varied = [
+            [("C", 4, 4)],
+            [("D", 4, 4)],
+            [("E", 4, 4)],
+            [("F", 4, 4)],
+            [("G", 4, 4)],
+            [("A", 4, 4)],
+            [("B", 4, 4)],
+            [("C", 5, 4)],
+        ]
+        gt_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, b, with_attrs=(i == 0)) for i, b in enumerate(varied))
+        )
+        # Same-length collapse into 2-bar loop
+        collapsed = varied[:2] + [[("E", 4, 4)], [("F", 4, 4)]] * 3
+        pred_collapsed = _wrap_partwise(
+            "".join(self._bar(i + 1, b, with_attrs=(i == 0)) for i, b in enumerate(collapsed))
+        )
+        res_col = align_and_score_cer(parse_musicxml(pred_collapsed), parse_musicxml(gt_xml))
+        self.assertTrue(res_col.has_repetition_loop)
+
+        # Runaway extra measures repeating 2-bar loop
+        runaway = varied[:2] + [[("E", 4, 4)], [("F", 4, 4)]] * 5
+        pred_runaway = _wrap_partwise(
+            "".join(self._bar(i + 1, b, with_attrs=(i == 0)) for i, b in enumerate(runaway))
+        )
+        res_run = align_and_score_cer(parse_musicxml(pred_runaway), parse_musicxml(gt_xml))
+        self.assertTrue(res_run.has_repetition_loop)
+
+    def test_runaway_loop_extending_genuine_ostinato_flagged(self) -> None:
+        """A runaway 12-bar loop on a 6-bar GT ostinato MUST still be flagged."""
+        pat = [("C", 4, 1), ("E", 4, 1), ("G", 4, 1), ("E", 4, 1)]
+        gt_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, pat, with_attrs=(i == 0)) for i in range(6))
+        )
+        pred_xml = _wrap_partwise(
+            "".join(self._bar(i + 1, pat, with_attrs=(i == 0)) for i in range(12))
+        )
+        res = align_and_score_cer(parse_musicxml(pred_xml), parse_musicxml(gt_xml))
+        self.assertTrue(res.has_repetition_loop)
 
 
 if __name__ == "__main__":
